@@ -1,0 +1,38 @@
+name: ci
+
+# Every push and pull request. The suites need no network, no hardware and no
+# privilege: they run against a fake sysfs hwmon tree, recording ectool and
+# systemctl stubs, and TEP_SUDO="" to drop the sudo prefix. That is what makes
+# a fan-control engine testable on a runner with no embedded controller at all.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        # Printed because a suite that behaves differently on the runner than
+        # on a workstation is the thing hardest to debug from a log alone.
+        run: |
+          bash --version | head -1
+          shellcheck --version | sed -n 2p
+          # test-run.sh drives the real daemon loop and polls for its effects,
+          # so sub-second sleep has to actually work here.
+          sleep 0.1 && echo "fractional sleep ok"
+
+      - name: shellcheck
+        # Globbed, not listed: a named list quietly stops covering the next test
+        # file somebody adds.
+        run: shellcheck -S warning thermal-exhaust-port.sh tests/*.sh
+
+      - name: tests
+        run: tests/run-all.sh

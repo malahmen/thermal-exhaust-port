@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Curve parsing, validation and the hysteresis walk — all through `simulate`,
+# which touches no hardware, so this runs anywhere.
+#
+# Usage: tests/test-curve.sh            # uses ../thermal-exhaust-port.sh
+#        TEP=/path/to/engine.sh tests/test-curve.sh
+set -uo pipefail
+
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+E="${TEP:-${TEST_DIR}/../thermal-exhaust-port.sh}"
+[[ -f "$E" ]] || { echo "engine not found at $E" >&2; exit 1; }
+
+# A stray TEP_* in the caller's environment would override the flags under
+# test and quietly invalidate every assertion here.
+unset TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS TEP_UNIT TEP_BIN
+
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# No unit anywhere: these assertions are about the given curve, not an
+# installed one.
+# The command comes first, so Q takes it as $1 and appends the flags after it.
+Q() { local c="$1"; shift; bash "$E" "$c" --unit "$T/none.service" "$@"; }
+
+FAILS=0
+check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
+fails()  { ! Q "$@" >/dev/null 2>&1; }
+silent() { Q "$@" >/dev/null 2>&1; }
+
+echo "## 1. the walk up and back down"
+
+out="$(Q simulate --curve "72:35 78:60 84:85 88:100" 71 72 79 85 89 84 79 73 67 2>/dev/null)"
+want=$'71\tauto (EC)\n72\t35%\n79\t60%\n85\t85%\n89\t100%\n84\t100%\n79\t60%\n73\t35%\n67\tauto (EC)'
+check "rising then falling matches the expected steps" [ "$out" = "$want" ]
+
+# The point of hysteresis: 84 on the way down holds 100% (84 >= 88-4), and the
+# step is only left once the temperature clears it by HYST.
+check "a step is held until HYST below it" \
+    [ "$(Q simulate --curve "72:35 78:60 84:85 88:100" 89 84 2>/dev/null | tail -1)" = "$(printf '84\t100%%')" ]
+check "and is left one degree further down" \
+    [ "$(Q simulate --curve "72:35 78:60 84:85 88:100" 89 83 2>/dev/null | tail -1)" = "$(printf '83\t85%%')" ]
+
+# A single reading that jumps several steps must land on the right one, not
+# creep up one step per tick.
+check "one reading can climb several steps at once" \
+    [ "$(Q simulate --curve "72:35 78:60 84:85 88:100" 95 2>/dev/null)" = "$(printf '95\t100%%')" ]
+
+check "hyst 0 steps down as soon as the threshold is crossed" \
+    [ "$(Q simulate --curve "70:40 80:100" --hyst 0 85 79 2>/dev/null | tail -1)" = "$(printf '79\t40%%')" ]
+
+check "below the first point the EC gets control back" \
+    [ "$(Q simulate --curve "70:40" 60 2>/dev/null)" = "$(printf '60\tauto (EC)')" ]
+check "a single-point curve is a valid curve" \
+    [ "$(Q simulate --curve "70:40" 75 2>/dev/null)" = "$(printf '75\t40%%')" ]
+check "0% is a usable duty (fans off, still under our control)" \
+    [ "$(Q simulate --curve "70:0" 75 2>/dev/null)" = "$(printf '75\t0%%')" ]
+
+# Sub-zero readings are not hypothetical: a sensor that has not initialised can
+# report a negative value, and it must not be treated as a parse error.
+check "a negative temperature is read, not rejected" \
+    [ "$(Q simulate --curve "70:40" -- -5 2>/dev/null)" = "$(printf -- '-5\tauto (EC)')" ]
+
+echo "## 2. the curve is validated before anything uses it"
+
+check "a non-ascending curve is rejected"      fails simulate --curve "80:50 70:40" 75
+check "equal temperatures are rejected"        fails simulate --curve "70:40 70:50" 75
+check "a duty above 100 is rejected"           fails simulate --curve "70:140" 75
+check "a malformed point is rejected"          fails simulate --curve "70-40" 75
+check "a point missing its duty is rejected"   fails simulate --curve "70:" 75
+check "an empty curve is rejected"             fails simulate --curve "" 75
+check "a non-numeric temperature is rejected"  fails simulate --curve "70:40" abc
+check "simulate with no temperatures is rejected" fails simulate --curve "70:40"
+
+# The message has to name the offending point: "bad curve" alone leaves you
+# bisecting a twelve-point curve by hand.
+err="$(Q simulate --curve "70:40 65:50" 75 2>&1 >/dev/null)"
+check "the rejection names the offending point" grep -q '65:50' <<< "$err"
+
+echo "## 3. flags and commands"
+
+check "a bad --hyst is rejected"      fails simulate --curve "70:40" --hyst x 75
+check "a bad --interval is rejected"  fails simulate --curve "70:40" --interval x 75
+check "--interval 0 is rejected"      fails simulate --curve "70:40" --interval 0 75
+check "an unknown flag is rejected"   fails simulate --curve "70:40" --nope 75
+check "an unknown command is rejected" fails frobnicate
+check "--help exits 0"                silent --help
+check "version prints the name"       grep -q 'thermal-exhaust-port' <<< "$(Q version 2>/dev/null)"
+
+# simulate is the "what if" command: it must answer about the curve it was
+# given, never about an installed unit. Checked explicitly because the opposite
+# choice was made for status/once/curve, and the two are easy to confuse.
+printf '[Service]\nEnvironment="TEP_CURVE=10:99"\n' > "$T/u.service"
+check "simulate ignores the installed unit" \
+    [ "$(bash "$E" simulate --unit "$T/u.service" --curve "70:40" 75 2>/dev/null)" = "$(printf '75\t40%%')" ]
+check "curve reads the installed unit" \
+    [ "$(bash "$E" curve --unit "$T/u.service" 2>/dev/null)" = "$(printf '10\t99')" ]
+
+echo
+if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi
+echo "all checks passed"
