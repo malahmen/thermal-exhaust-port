@@ -21,7 +21,19 @@ unset TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS
 # the script's OWN process group and takes the suite down with it.
 PID=""
 T="$(mktemp -d)"
-trap '[[ -n "$PID" ]] && kill "$PID" 2>/dev/null; rm -rf "$T"' EXIT
+# A daemon that ignores TERM (the regression section 4 catches) must not
+# outlive the suite, hence the KILL. The TERM trap lets run-all's timeout stop
+# this script and still run the cleanup.
+stop_daemon() {
+    [[ -n "$PID" ]] || return 0
+    local i=0
+    kill "$PID" 2>/dev/null
+    while kill -0 "$PID" 2>/dev/null && (( i < 30 )); do sleep 0.1; i=$(( i + 1 )); done
+    kill -KILL "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
+    PID=""
+}
+trap 'stop_daemon; rm -rf "$T"' EXIT
+trap 'exit 143' TERM INT
 T="$(cd "$T" && pwd)"
 mkdir -p "$T/stub" "$T/hwmon/hwmon0"
 CALLS="$T/calls"; : > "$CALLS"; export CALLS
@@ -33,8 +45,11 @@ mkdir -p "$T/hwmon/hwmon1"; printf 'amdgpu\n' > "$T/hwmon/hwmon1/name"
 GPU="$T/hwmon/hwmon1/temp1_input"; printf '30000\n' > "$GPU"
 LOG="$T/run.log"
 
+# While $FAILFLAG exists the stub refuses, the way a busy or wedged EC does.
+FAILFLAG="$T/ectool-fails"; export FAILFLAG
 cat > "$T/stub/ectool" <<'STUB'
 #!/usr/bin/env bash
+if [[ -e "$FAILFLAG" ]]; then printf 'FAILED %s\n' "$*" >> "$CALLS"; exit 1; fi
 printf '%s\n' "$*" >> "$CALLS"
 exit 0
 STUB
@@ -116,13 +131,19 @@ echo "## 2. nothing changed means nothing is re-sent, except the re-assert"
 # The EC forgets a forced duty across suspend/resume, so the current state is
 # re-sent every --reassert seconds even when the step has not moved. That is
 # the ONLY repeat the loop should make.
+#
+# The step change is waited for BEFORE the log is cleared: before, the log was
+# cleared first, so the step change itself (auto -> 100%) landed afterwards and
+# satisfied the check with the re-assert deleted.
 settemp 85
-wait_for "fanduty 100" || true
+check "85C is back on the 80:100 step"              wait_last "fanduty 100" 60
+: > "$CALLS"
+check "a steady temperature re-asserts (--reassert 3)" wait_for "fanduty 100" 70
 : > "$CALLS"
 sleep 4
 n="$(count 'fanduty 100')"
-check "a steady temperature re-asserts, not spins"  [ "$n" -ge 1 ]
-check "and re-asserts sparingly, not every tick"    [ "$n" -le 3 ]
+check "and re-asserts sparingly, not every tick"    [ "$n" -le 2 ]
+check "  and sends nothing else"                    [ "$(grep -cvF 'fanduty 100' "$CALLS")" = "0" ]
 
 echo "## 3. a lost sensor: said out loud, held for a moment, then the EC"
 
@@ -154,9 +175,33 @@ echo "## 4. stopping hands the fans back"
 
 : > "$CALLS"
 kill -TERM "$PID" 2>/dev/null
-wait "$PID" 2>/dev/null
-check "SIGTERM triggers autofanctrl"         wait_for "autofanctrl" 30
-PID=""
+# Bounded: a TERM handler that only cleans up does not end bash, and a bare
+# `wait` here would then hang the suite instead of failing it.
+i=0; while kill -0 "$PID" 2>/dev/null && (( i < 50 )); do sleep 0.1; i=$(( i + 1 )); done
+check "SIGTERM ends the daemon (within 5 s)" bash -c '! kill -0 "$1" 2>/dev/null' _ "$PID"
+check "  and hands the fans back"            wait_for "autofanctrl" 30
+stop_daemon
+
+echo "## 4b. a refused ectool call is retried every tick"
+
+# --reassert 60, so nothing but the retry can send the duty again inside the
+# window: a loop that marked a refused step as applied would sit on the old
+# duty until the next re-assert, a minute later.
+settemp 71
+: > "$CALLS"
+TEP_SUDO="" bash "$E" run --curve "70:40 80:100" --hyst 4 --interval 1 --reassert 60 \
+    --sensors k10temp --hwmon "$T/hwmon" --ectool "$T/stub/ectool" >"$T/retry.log" 2>&1 &
+PID=$!
+check "the retry daemon is on the 70:40 step" wait_for "fanduty 40"
+: > "$FAILFLAG"
+settemp 85
+check "a refused step change is attempted"   wait_for "FAILED fanduty 100"
+wait_n() { local i=0; while (( i < 50 )); do (( $(count "$1") >= $2 )) && return 0; sleep 0.1; i=$(( i + 1 )); done; return 1; }
+check "  and retried on the next tick"       wait_n "FAILED fanduty 100" 2
+check "  each refusal logged"                grep -q 'ectool refused 85C -> 100%' "$T/retry.log"
+rm -f "$FAILFLAG"
+check "it lands as soon as ectool answers"   wait_last "fanduty 100" 30
+stop_daemon
 
 echo "## 5. the unit's environment reaches the daemon"
 
@@ -197,7 +242,7 @@ check "the daemon applies the unit's curve, not its defaults" wait_for "fanduty 
 check "  and announces the unit's curve"    grep -qF '55:25 65:55 85:100' "$T/unitrun.log"
 check "  with the unit's hysteresis"        grep -qF 'hysteresis 7C' "$T/unitrun.log"
 check "  and the unit's sensor set"         grep -qF 'sensors: k10temp)' "$T/unitrun.log"
-kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
+stop_daemon
 
 # Every key render_unit writes must be one the engine reads, or the next rename
 # reintroduces the same silent split.
@@ -249,7 +294,7 @@ TEP_SUDO="" TEP_ALLOW_STOP=1 bash "$E" run --curve "60:0 90:100" --interval 1 --
     --hwmon "$T/hwmon" --ectool "$T/stub/ectool" >/dev/null 2>&1 &
 PID=$!
 check "TEP_ALLOW_STOP=1 (the unit's form) lets it run" wait_for "fanduty 0"
-kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
+stop_daemon
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

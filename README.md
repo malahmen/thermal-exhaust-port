@@ -258,7 +258,11 @@ tests/run-all.sh
 No network, no hardware, no privilege — a fake sysfs tree, recording `ectool`
 and `systemctl` stubs, and `TEP_SUDO=""`. `tests/test-run.sh` drives the real
 daemon loop, changes the temperature under it, and asserts on the `ectool` calls
-it makes.
+it makes: the re-assert on a steady temperature, a refused `ectool` call retried
+on the next tick, a lost sensor, and the daemon actually exiting on `TERM`
+(bounded, so a regression fails rather than hangs). `run-all.sh` also bounds
+each file (`TEP_TEST_TIMEOUT`, default 300 s), and `tests/test-run-all.sh`
+checks that it does.
 
 ## License
 
