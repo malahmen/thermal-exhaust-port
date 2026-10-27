@@ -207,7 +207,14 @@ journal lines for the real answer.
   read. A hardcoded `hwmon6` silently starts reading the wrong chip.
 - **An unreadable sensor is not a cold machine.** A failed read holds the
   current duty and says so once, rather than handing a hot machine back to the
-  EC on the strength of it.
+  EC on the strength of a driver rebinding. But not indefinitely: after 3
+  failed reads in a row the fans go back to the EC — whose own control reads
+  its own sensors — with an `[error]` line, and the curve resumes when a
+  watched sensor answers again. A blind loop would otherwise hold a possibly
+  low duty on a machine that is heating up.
+- **A watched chip that disappears is logged** (`watched sensor 'amdgpu' is
+  gone`), as is one that is missing at start and one that comes back: the
+  curve then follows the others, which may be the cooler ones.
 - **The fans always go back to the EC.** An `EXIT` trap, separate signal traps
   that actually exit, and `ExecStopPost` in the unit. A `TERM` handler that only
   cleans up does *not* end the process — bash resumes the loop — so `systemctl

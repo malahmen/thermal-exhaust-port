@@ -89,6 +89,10 @@ INTERVAL="${TEP_INTERVAL:-3}"     # seconds between temperature checks
 # and a loop that looks less often than once a minute is not controlling it.
 MAX_INTERVAL=60
 REASSERT="${TEP_REASSERT:-60}"    # seconds; re-send the current state to the EC
+# Failed reads in a row before the daemon stops holding the last duty and hands
+# the fans back to the EC: long enough to ride out a driver rebinding, short
+# enough that a blind loop does not hold a low duty on a machine heating up.
+BLIND_READS=3
 SENSORS="${TEP_SENSORS:-k10temp amdgpu}"  # hwmon names to watch, hottest wins
 # A step at 0% stops the fans while the machine is hotter than where the EC's
 # own control keeps them turning; refused unless this says it is meant.
@@ -291,35 +295,39 @@ label() { if (( $1 < 0 )); then printf 'auto (EC)'; else printf '%s%%' "${CD[$1]
 # hwmon indices are not stable across reboots — a driver loading in a different
 # order renumbers them — so sensors are resolved by name on every read. A
 # hardcoded hwmon6 silently starts reading the wrong chip after a kernel update.
-_sensor_dirs() {
-    local want d
+#
+# _scan sets HOT to the hottest watched sensor in whole degrees, or "" (and
+# returns 1) when none could be read; FOUND to the watched names that gave a
+# reading, so the daemon can say when a chip drops out. "" is not 0: a failed
+# read must never look like a cold machine, because the curve would hand the
+# fans back to the EC on the strength of it.
+HOT="" FOUND=""
+_scan() {
+    local hi="" want d f v got
+    FOUND=""
     for want in $SENSORS; do
         for d in "$HWMON_ROOT"/hwmon*; do
             [[ -r "$d/name" ]] || continue
             [[ "$(<"$d/name")" == "$want" ]] || continue
-            printf '%s\n' "$d"
+            got=0
+            for f in "$d"/temp*_input; do
+                [[ -r "$f" ]] || continue
+                v="$(<"$f")" || continue
+                [[ "$v" =~ ^(-?)([0-9]{1,9})$ ]] || continue
+                v="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
+                got=1
+                if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
+            done
+            (( got )) && FOUND+="${FOUND:+ }${want}"
             break
         done
     done
+    HOT=""
+    [[ -n "$hi" ]] || return 1
+    HOT="$(( hi / 1000 ))"
 }
 
-# Echoes the hottest watched sensor in whole degrees, or "" when none could be
-# read. "" is not 0: a failed read must never look like a cold machine, because
-# the curve would hand the fans back to the EC on the strength of it.
-hottest() {
-    local hi="" d f v
-    while IFS= read -r d; do
-        for f in "$d"/temp*_input; do
-            [[ -r "$f" ]] || continue
-            v="$(<"$f")" || continue
-            [[ "$v" =~ ^(-?)([0-9]{1,9})$ ]] || continue
-            v="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
-            if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
-        done
-    done < <(_sensor_dirs)
-    [[ -n "$hi" ]] || return 1
-    printf '%s\n' $(( hi / 1000 ))
-}
+hottest() { _scan || return 1; printf '%s\n' "$HOT"; }
 
 # -----------------------------------------------------------------------------
 # EC
@@ -543,27 +551,52 @@ cmd_run() {
 
     info "curve: ${CURVE} (hysteresis ${HYST}C, every ${INTERVAL}s, sensors: ${SENSORS})"
 
-    local step=-1 applied=-2 last=0 temp now warned=0
+    local step=-1 applied=-2 last=0 temp now blind=0 had="$SENSORS" first=1 n
     while :; do
-        if ! temp="$(hottest)"; then
-            # Not fatal and not treated as cold: hold the current duty and say
-            # so once, rather than handing a hot machine back to the EC because
-            # a driver unbound for a moment.
-            (( warned )) || { warn "no readable sensor among: ${SENSORS} — holding $(label "$step")"; warned=1; }
-            sleep "$INTERVAL"
-            continue
-        fi
-        warned=0
+        if _scan; then temp="$HOT"; else temp=""; fi
 
-        step="$(decide "$temp" "$step")"
+        # A watched chip that stops answering is said out loud: the curve then
+        # follows the others, which may be the cooler ones.
+        if [[ "$FOUND" != "$had" ]]; then
+            for n in $had; do
+                [[ " $FOUND " == *" $n "* ]] && continue
+                if (( first )); then warn "watched sensor '${n}' not found under ${HWMON_ROOT} — the curve follows: ${FOUND:-nothing}"
+                else warn "watched sensor '${n}' is gone — the curve follows: ${FOUND:-nothing}"; fi
+            done
+            for n in $FOUND; do
+                [[ " $had " == *" $n "* ]] || info "watched sensor '${n}' is back"
+            done
+            had="$FOUND"
+        fi
+        first=0
+
+        if [[ -z "$temp" ]]; then
+            # Not treated as cold. For a moment — a driver rebinding — the
+            # current duty is held; past BLIND_READS the fans go back to the
+            # EC, whose own control reads its own sensors, rather than holding
+            # a possibly low duty on a machine nobody is watching.
+            blind=$(( blind + 1 ))
+            if (( blind < BLIND_READS )); then
+                (( blind == 1 )) && warn "no readable sensor among: ${SENSORS} — holding $(label "$step"); the EC gets the fans back after ${BLIND_READS} failed reads"
+                sleep "$INTERVAL"
+                continue
+            fi
+            (( blind == BLIND_READS )) && error "no readable sensor among: ${SENSORS} for ${BLIND_READS} reads in a row — handing the fans back to the EC until one answers"
+            step=-1; temp="no sensor: "
+        else
+            (( blind >= BLIND_READS )) && info "a watched sensor answers again (${temp}C) — the curve resumes"
+            blind=0
+            step="$(decide "$temp" "$step")"
+            temp="${temp}C"
+        fi
         now="$SECONDS"
 
         if (( step != applied )); then
             if apply "$step"; then
                 applied="$step"; last="$now"
-                printf '%s%sC -> %s\n' "$(_pfx)" "$temp" "$(label "$step")" >&2
+                printf '%s%s -> %s\n' "$(_pfx)" "$temp" "$(label "$step")" >&2
             else
-                warn "ectool refused ${temp}C -> $(label "$step"); retrying next tick"
+                warn "ectool refused ${temp} -> $(label "$step"); retrying next tick"
             fi
         elif (( now - last >= REASSERT )); then
             # The EC forgets a forced duty across suspend/resume, so the

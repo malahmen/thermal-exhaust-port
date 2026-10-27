@@ -5,8 +5,9 @@
 #
 # Covered: the duty actually applied, climbing and falling, no duplicate call
 # when nothing changed, the periodic re-assert (the EC forgets across
-# suspend/resume), holding the last duty when sensors go unreadable, and the
-# hand-back to the EC on SIGTERM.
+# suspend/resume), a lost chip logged, holding the last duty for a moment when
+# sensors go unreadable and then handing back to the EC, refused curves, and
+# the hand-back on SIGTERM.
 #
 # Usage: tests/test-run.sh              # uses ../thermal-exhaust-port.sh
 set -uo pipefail
@@ -26,6 +27,11 @@ mkdir -p "$T/stub" "$T/hwmon/hwmon0"
 CALLS="$T/calls"; : > "$CALLS"; export CALLS
 TEMP="$T/hwmon/hwmon0/temp1_input"
 printf 'k10temp\n' > "$T/hwmon/hwmon0/name"
+# A second watched chip, always cooler: losing it must be said, not followed
+# silently.
+mkdir -p "$T/hwmon/hwmon1"; printf 'amdgpu\n' > "$T/hwmon/hwmon1/name"
+GPU="$T/hwmon/hwmon1/temp1_input"; printf '30000\n' > "$GPU"
+LOG="$T/run.log"
 
 cat > "$T/stub/ectool" <<'STUB'
 #!/usr/bin/env bash
@@ -48,6 +54,14 @@ wait_for() {
     local want="$1" limit="${2:-50}" i=0
     while (( i < limit )); do
         grep -qF "$want" "$CALLS" && return 0
+        sleep 0.1; i=$(( i + 1 ))
+    done
+    return 1
+}
+wait_log() {
+    local want="$1" limit="${2:-50}" i=0
+    while (( i < limit )); do
+        grep -qF -- "$want" "$LOG" 2>/dev/null && return 0
         sleep 0.1; i=$(( i + 1 ))
     done
     return 1
@@ -77,7 +91,7 @@ echo "## 1. the loop applies the curve"
 
 settemp 71
 TEP_SUDO="" bash "$E" run --curve "70:40 80:100" --hyst 4 --interval 1 --reassert 3 \
-    --sensors k10temp --hwmon "$T/hwmon" --ectool "$T/stub/ectool" >/dev/null 2>&1 &
+    --sensors "k10temp amdgpu" --hwmon "$T/hwmon" --ectool "$T/stub/ectool" >"$LOG" 2>&1 &
 PID=$!
 
 check "71C applies the 70:40 step"          wait_for "fanduty 40"
@@ -110,19 +124,31 @@ n="$(count 'fanduty 100')"
 check "a steady temperature re-asserts, not spins"  [ "$n" -ge 1 ]
 check "and re-asserts sparingly, not every tick"    [ "$n" -le 3 ]
 
-echo "## 3. an unreadable sensor holds the last duty"
+echo "## 3. a lost sensor: said out loud, held for a moment, then the EC"
 
-# The dangerous failure this prevents: treating a failed read as 0C and handing
-# a hot machine back to the EC's lazy curve.
+# Losing one watched chip leaves the curve on the others, which may be the
+# cooler ones — so it is logged, not followed silently.
 : > "$CALLS"
+mv "$GPU" "$T/parked-gpu"
+check "a watched chip going away is logged"   wait_log "watched sensor 'amdgpu' is gone"
+check "  and the curve carries on on the rest" [ "$(count autofanctrl)" = "0" ]
+
+# The dangerous failure: treating a failed read as 0C and handing a hot machine
+# back to the EC's lazy curve on the strength of a driver rebinding. So the
+# first failed read holds the duty...
 mv "$TEMP" "$T/parked"
-sleep 3
-check "no hand-back when sensors disappear"  [ "$(count autofanctrl)" = "0" ]
-# Nothing is re-sent while blind either — there is no reading to justify a
-# duty — so "held" means the EC keeps the last duty it was given, which is the
-# absence of any new call rather than a repeat of the old one.
-check "and no lower step is applied on a guess" [ "$(count 'fanduty 40')" = "0" ]
-mv "$T/parked" "$TEMP"
+check "the first failed read is reported"     wait_log "no readable sensor among"
+check "  and holds the duty: no hand-back yet" [ "$(count autofanctrl)" = "0" ]
+check "  and no lower step on a guess"        [ "$(count 'fanduty 40')" = "0" ]
+# ...but not forever: blind, a held duty may be a low one on a machine that is
+# heating up. After 3 failed reads the EC, which reads its own sensors, gets
+# the fans back — loudly.
+check "after 3 failed reads the fans go back to the EC" wait_for "autofanctrl" 60
+check "  said as an error"                    grep -q '\[error\] no readable sensor.*handing the fans back' "$LOG"
+check "  and never a lower duty"              [ "$(count 'fanduty 40')" = "0" ]
+mv "$T/parked" "$TEMP"; mv "$T/parked-gpu" "$GPU"
+check "the curve resumes when a sensor answers" wait_last "fanduty 100" 60
+check "  and the chip's return is logged"     wait_log "watched sensor 'amdgpu' is back"
 
 echo "## 4. stopping hands the fans back"
 
