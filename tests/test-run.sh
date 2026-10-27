@@ -158,8 +158,9 @@ check "  and the curve carries on on the rest" [ "$(count autofanctrl)" = "0" ]
 # back to the EC's lazy curve on the strength of a driver rebinding. So the
 # first failed read holds the duty...
 mv "$TEMP" "$T/parked"
-check "the first failed read is reported"     wait_log "no readable sensor among"
-check "  and holds the duty: no hand-back yet" [ "$(count autofanctrl)" = "0" ]
+check "the first failed read holds the duty, saying so" wait_log "— holding 100%"
+sleep 0.5
+check "  no hand-back on it"                  [ "$(count autofanctrl)" = "0" ]
 check "  and no lower step on a guess"        [ "$(count 'fanduty 40')" = "0" ]
 # ...but not forever: blind, a held duty may be a low one on a machine that is
 # heating up. After 3 failed reads the EC, which reads its own sensors, gets
