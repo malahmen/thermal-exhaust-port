@@ -93,6 +93,31 @@ check "simulate ignores the installed unit" \
 check "curve reads the installed unit" \
     [ "$(bash "$E" curve --unit "$T/u.service" 2>/dev/null)" = "$(printf '10\t99')" ]
 
+echo "## 4. numbers are decimal, whatever their leading zeros"
+
+# Bash arithmetic reads a leading zero as octal. Before: 072 was a step at 58C,
+# 090 was refused with a misleading "must ascend", and --hyst 08 passed the
+# check and then broke every step-down comparison — the fan never came down.
+check "072:35 is a step at 72C, not 58C" \
+    [ "$(Q simulate --curve "072:35" 60 72 2>/dev/null)" = "$(printf '60\tauto (EC)\n72\t35%%')" ]
+check "08 and 090 are valid temperatures" \
+    [ "$(Q simulate --curve "08:10 090:100" 9 90 2>/dev/null)" = "$(printf '9\t10%%\n90\t100%%')" ]
+check "a zero-padded duty is decimal" \
+    [ "$(Q simulate --curve "70:080" 75 2>/dev/null)" = "$(printf '75\t80%%')" ]
+check "--hyst 08 steps down 8 below the step" \
+    [ "$(Q simulate --curve "70:40 80:100" --hyst 08 85 72 71 2>/dev/null)" = "$(printf '85\t100%%\n72\t100%%\n71\t40%%')" ]
+check "a zero-padded simulate temperature is decimal" \
+    [ "$(Q simulate --curve "70:40" 071 2>/dev/null)" = "$(printf '71\t40%%')" ]
+check "--interval 09 is accepted"      silent simulate --curve "70:40" --interval 09 75
+
+echo "## 5. --interval has a ceiling"
+
+check "--interval 60 is accepted"      silent simulate --curve "70:40" --interval 60 75
+check "--interval 61 is refused"       fails simulate --curve "70:40" --interval 61 75
+err="$(Q simulate --curve "70:40" --interval 600 75 2>&1 >/dev/null)"
+check "  and the refusal states the ceiling" grep -q 'at most 60 seconds' <<< "$err"
+check "a 20-digit number is refused, not overflowed" fails simulate --curve "70:40" --hyst 99999999999999999999 75
+
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi
 echo "all checks passed"

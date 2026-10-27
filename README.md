@@ -100,7 +100,7 @@ $ ./thermal-exhaust-port.sh simulate --curve "72:35 78:60 84:85 88:100" 71 72 79
 | --- | --- | --- | --- |
 | `--curve` | `TEP_CURVE` | `72:35 78:60 84:85 88:100` | `degC:duty%` points, ascending |
 | `--hyst` | `TEP_HYST` | `4` | degC to fall below a step before dropping to it |
-| `--interval` | `TEP_INTERVAL` | `3` | seconds between checks |
+| `--interval` | `TEP_INTERVAL` | `3` | seconds between checks, 1-60: a loaded SoC climbs tens of degrees in a few seconds |
 | `--reassert` | `TEP_REASSERT` | `60` | seconds; re-send the current state |
 | `--sensors` | `TEP_SENSORS` | `k10temp amdgpu` | hwmon names to watch, hottest wins |
 | `--ectool` | `TEP_ECTOOL` | `/usr/bin/ectool` | the EC tool |
@@ -198,6 +198,9 @@ journal lines for the real answer.
   stop` would otherwise hand the fans back and then wait for SIGKILL.
 - **The EC forgets a forced duty across suspend/resume**, so the current state
   is re-sent every `--reassert` seconds even when nothing changed.
+- **Numbers are decimal.** Curve points, `--hyst`, `--interval`, `--reassert`
+  and the unit's values are read with `10#`, so `072:35` is a step at 72 °C
+  and `--hyst 08` is 8 — bash arithmetic would otherwise take them as octal.
 - **`set -e` is deliberately absent.** `(( s-- ))` evaluating to 0 returns
   non-zero, and errexit would kill the daemon loop mid-step.
 - **The unit is parsed in pure bash**, not by `eval`-ing `systemctl show -p

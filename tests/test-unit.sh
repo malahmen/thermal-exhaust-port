@@ -133,6 +133,16 @@ check "an explicit --curve overrides the unit" \
 check "and config_source admits the override" \
     grep -q 'overrides' <<< "$(Q config --curve "60:20" 2>/dev/null)"
 
+# A unit's values never went through flag parsing, so they are validated and
+# read as decimal too: a hand-edited TEP_HYST=08 would otherwise break every
+# step-down comparison the daemon makes.
+cp "$UNIT" "$T/unit.bak"
+printf 'Environment=TEP_HYST=08\n' >> "$UNIT"
+check "a unit's zero-padded hyst is read as decimal" [ "$(cfg hyst)" = "8" ]
+printf 'Environment=TEP_INTERVAL=600\n' >> "$UNIT"
+check "a unit's out-of-range interval is refused"   nq config
+cp "$T/unit.bak" "$UNIT"
+
 echo "## 4. an existing unit is somebody's tuning"
 
 # A line nothing in render_unit produces: if it survives, the file was edited

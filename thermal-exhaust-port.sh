@@ -85,6 +85,9 @@ dbg()        { if (( VERBOSE )); then printf '%s[debug] %s\n' "$(_pfx)" "$*" >&2
 CURVE="${TEP_CURVE:-72:35 78:60 84:85 88:100}"
 HYST="${TEP_HYST:-4}"             # degC to fall below a step before dropping to it
 INTERVAL="${TEP_INTERVAL:-3}"     # seconds between temperature checks
+# The cap on --interval: a loaded SoC climbs tens of degrees in a few seconds,
+# and a loop that looks less often than once a minute is not controlling it.
+MAX_INTERVAL=60
 REASSERT="${TEP_REASSERT:-60}"    # seconds; re-send the current state to the EC
 SENSORS="${TEP_SENSORS:-k10temp amdgpu}"  # hwmon names to watch, hottest wins
 
@@ -149,7 +152,7 @@ COMMANDS
 FLAGS
   --curve POINTS           "degC:duty%" points, ascending (default: ${CURVE})
   --hyst N                 degC to fall below a step before dropping to it (default: ${HYST})
-  --interval N             seconds between temperature checks (default: ${INTERVAL})
+  --interval N             seconds between temperature checks, 1-${MAX_INTERVAL} (default: ${INTERVAL})
   --reassert N             seconds; re-send the current state to the EC (default: ${REASSERT})
   --sensors "NAME..."      hwmon names to watch, hottest wins (default: ${SENSORS})
   --ectool PATH            ectool binary (default: ${ECTOOL})
@@ -208,20 +211,28 @@ EOF
 # Curve
 # -----------------------------------------------------------------------------
 
+# Numbers are read as decimal, always. Bash arithmetic takes a leading zero as
+# octal: "072:35" became a step at 58C, "090" a misleading "must ascend", and
+# --hyst 08 passed the regex and then broke every step-down comparison, so the
+# fan never stepped down. Six digits is far past any real value and keeps a
+# typo from overflowing the arithmetic.
+_dec() { printf '%d' "$(( 10#$1 ))"; }
+
 CT=() CD=()
 parse_curve() {
-    local pt last=-1
+    local pt t d last=-1
     CT=(); CD=()
     for pt in $CURVE; do
-        [[ "$pt" =~ ^([0-9]+):([0-9]+)$ ]] \
+        [[ "$pt" =~ ^([0-9]{1,6}):([0-9]{1,6})$ ]] \
             || error_exit "bad curve point '${pt}' — want degC:duty%, e.g. 72:35"
-        (( BASH_REMATCH[2] <= 100 )) \
+        t="$(_dec "${BASH_REMATCH[1]}")"; d="$(_dec "${BASH_REMATCH[2]}")"
+        (( d <= 100 )) \
             || error_exit "duty out of range in '${pt}' — 0-100"
-        (( BASH_REMATCH[1] > last )) \
+        (( t > last )) \
             || error_exit "curve must ascend by temperature: '${pt}' follows ${last}C"
-        last="${BASH_REMATCH[1]}"
-        CT+=("${BASH_REMATCH[1]}")
-        CD+=("${BASH_REMATCH[2]}")
+        last="$t"
+        CT+=("$t")
+        CD+=("$d")
     done
     (( ${#CT[@]} )) || error_exit "empty curve"
 }
@@ -268,7 +279,8 @@ hottest() {
         for f in "$d"/temp*_input; do
             [[ -r "$f" ]] || continue
             v="$(<"$f")" || continue
-            [[ "$v" =~ ^-?[0-9]+$ ]] || continue
+            [[ "$v" =~ ^(-?)([0-9]{1,9})$ ]] || continue
+            v="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
             if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
         done
     done < <(_sensor_dirs)
@@ -398,6 +410,7 @@ load_unit_config() {
         fi
         (( seen )) && CONFIG_SRC="$UNIT"
         (( overridden )) && CONFIG_SRC="${CONFIG_SRC} + overrides"
+        validate_numbers
     fi
     # Always, even with no unit to read: every caller of this function then
     # works from a parsed curve, so 'curve' and 'config' do not silently report
@@ -510,7 +523,8 @@ cmd_simulate() {
     parse_curve
     local s=-1 t
     for t in "$@"; do
-        [[ "$t" =~ ^-?[0-9]+$ ]] || error_exit "not a temperature: ${t}"
+        [[ "$t" =~ ^(-?)([0-9]{1,6})$ ]] || error_exit "not a temperature: ${t}"
+        t="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
         s="$(decide "$t" "$s")"
         printf '%s\t%s\n' "$t" "$(label "$s")"
     done
@@ -534,7 +548,8 @@ cmd_sensors() {
         for f in "$d"/temp*_input; do
             [[ -r "$f" ]] || continue
             v="$(<"$f")" || continue
-            [[ "$v" =~ ^-?[0-9]+$ ]] || continue
+            [[ "$v" =~ ^(-?)([0-9]{1,9})$ ]] || continue
+            v="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
             if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
         done
         watched=0
@@ -727,6 +742,21 @@ cmd_set_curve() {
     fi
 }
 
+# Validated in one place, so every command fails the same way on a bad number
+# instead of each one growing its own check — and called again after a unit's
+# values are adopted, which no flag parsing ever saw. Each value is rewritten
+# in decimal (see _dec).
+validate_numbers() {
+    local n
+    for n in HYST INTERVAL REASSERT; do
+        [[ "${!n}" =~ ^[0-9]{1,6}$ ]] || error_exit "--${n,,} must be a non-negative integer (got '${!n}')"
+        printf -v "$n" '%s' "$(_dec "${!n}")"
+    done
+    (( INTERVAL >= 1 )) || error_exit "--interval must be at least 1 second"
+    (( INTERVAL <= MAX_INTERVAL )) \
+        || error_exit "--interval must be at most ${MAX_INTERVAL} seconds (got ${INTERVAL}) — a slower loop cannot follow a loaded SoC"
+}
+
 # -----------------------------------------------------------------------------
 main() {
     local cmd="${1:-}" args=()
@@ -767,13 +797,7 @@ main() {
     SERVICE="${UNIT##*/}"
     [[ "$SERVICE" == *.service ]] || error_exit "--unit must name a .service file (got '${UNIT##*/}')"
 
-    # Validated once, here, so every command fails the same way on a bad number
-    # instead of each one growing its own check.
-    local n
-    for n in HYST INTERVAL REASSERT; do
-        [[ "${!n}" =~ ^[0-9]+$ ]] || error_exit "--${n,,} must be a non-negative integer (got '${!n}')"
-    done
-    (( INTERVAL >= 1 )) || error_exit "--interval must be at least 1 second"
+    validate_numbers
 
     # `tep --curve X simulate 75` is a natural thing to type, and taking $1 as
     # the command turns it into "unknown command: --curve". Name the real
