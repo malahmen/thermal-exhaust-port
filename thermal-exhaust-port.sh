@@ -90,6 +90,9 @@ INTERVAL="${TEP_INTERVAL:-3}"     # seconds between temperature checks
 MAX_INTERVAL=60
 REASSERT="${TEP_REASSERT:-60}"    # seconds; re-send the current state to the EC
 SENSORS="${TEP_SENSORS:-k10temp amdgpu}"  # hwmon names to watch, hottest wins
+# A step at 0% stops the fans while the machine is hotter than where the EC's
+# own control keeps them turning; refused unless this says it is meant.
+ALLOW_STOP="${TEP_ALLOW_STOP:-0}"
 
 ECTOOL="${TEP_ECTOOL:-/usr/bin/ectool}"
 HWMON_ROOT="${TEP_HWMON:-/sys/class/hwmon}"
@@ -112,7 +115,7 @@ ASSUME_YES=0
 # Which knobs were given explicitly (flag or TEP_* variable)? An explicit value
 # always wins over what the installed unit says; see load_unit_config.
 declare -A FROM_ENV=()
-for _k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS; do
+for _k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS TEP_ALLOW_STOP; do
     [[ -n "${!_k+set}" ]] && FROM_ENV["${_k#TEP_}"]=1
 done
 unset _k
@@ -155,6 +158,8 @@ FLAGS
   --interval N             seconds between temperature checks, 1-${MAX_INTERVAL} (default: ${INTERVAL})
   --reassert N             seconds; re-send the current state to the EC (default: ${REASSERT})
   --sensors "NAME..."      hwmon names to watch, hottest wins (default: ${SENSORS})
+  --allow-stop             let a curve start with 0% steps (fans stopped); without
+                           it run, install and set-curve refuse such a curve
   --ectool PATH            ectool binary (default: ${ECTOOL})
   --hwmon DIR              sysfs hwmon root (default: ${HWMON_ROOT})
   --unit-dirs "DIR..."     where the conflict scan looks for unit files
@@ -170,6 +175,11 @@ THE CURVE
   Each "degC:duty%" point is a step. The duty applied is the highest step whose
   temperature the hottest watched sensor has reached. Below the first point the
   EC's own control is handed back (ectool autofanctrl).
+
+  A fan must never cool less as it gets hotter, so duties may not fall from one
+  step to the next ("72:60 80:20" is refused), and 0% — fans stopped — can only
+  be the coolest steps. Even there it stops fans the EC would keep turning, so
+  run, install and set-curve refuse it without --allow-stop; simulate warns.
 
   Hysteresis is one-sided: a step is entered at its temperature but only left
   once the temperature falls HYST degrees below it, so a machine hovering on a
@@ -220,7 +230,7 @@ _dec() { printf '%d' "$(( 10#$1 ))"; }
 
 CT=() CD=()
 parse_curve() {
-    local pt t d last=-1
+    local pt t d last=-1 lastd=0
     CT=(); CD=()
     for pt in $CURVE; do
         [[ "$pt" =~ ^([0-9]{1,6}):([0-9]{1,6})$ ]] \
@@ -230,11 +240,34 @@ parse_curve() {
             || error_exit "duty out of range in '${pt}' — 0-100"
         (( t > last )) \
             || error_exit "curve must ascend by temperature: '${pt}' follows ${last}C"
-        last="$t"
+        # The fan must never cool less as it gets hotter. Non-falling duties also
+        # confine 0% to the leading steps; _check_stop deals with those.
+        (( d >= lastd )) \
+            || error_exit "duty must not fall as it gets hotter: '${pt}' is ${d}% after ${lastd}%"
+        last="$t"; lastd="$d"
         CT+=("$t")
         CD+=("$d")
     done
     (( ${#CT[@]} )) || error_exit "empty curve"
+}
+
+# _check_stop refuse|warn — a curve whose first steps are 0% stops the fans
+# from the first point up, where below it the EC's own control keeps them
+# turning: hotter, and cooled less. Refused for anything that applies a curve
+# unless --allow-stop (TEP_ALLOW_STOP=1) says the fans may stop; reports warn.
+_check_stop() {
+    local i from to="" where
+    (( ${#CD[@]} )) && (( CD[0] == 0 )) || return 0
+    from="${CT[0]}"
+    for (( i = 1; i < ${#CD[@]}; i++ )); do
+        (( CD[i] == 0 )) || { to="${CT[i]}"; break; }
+    done
+    where="from ${from}C ${to:+until ${to}C}${to:-up}"
+    (( ALLOW_STOP )) && { dbg "0% ${where} allowed by --allow-stop"; return 0; }
+    if [[ "$1" == refuse ]]; then
+        error_exit "the curve forces 0% ${where}, which STOPS the fans there — below ${from}C the EC's own control keeps them turning. Raise those steps, or pass --allow-stop if the fans may stop."
+    fi
+    warn "this curve forces 0% ${where}, which stops the fans there; run, install and set-curve refuse it without --allow-stop"
 }
 
 # decide TEMP CURRENT_STEP — echoes the new step. -1 means "let the EC decide".
@@ -397,7 +430,7 @@ load_unit_config() {
         # TEP_-prefixed, matching what the daemon reads from its environment.
         # These MUST be the same names render_unit writes: a unit setting a key
         # the daemon ignores makes `status` report a curve that is not running.
-        for key in CURVE HYST INTERVAL REASSERT SENSORS; do
+        for key in CURVE HYST INTERVAL REASSERT SENSORS ALLOW_STOP; do
             if [[ -n "${FROM_ENV[$key]:-}" ]]; then overridden=1; continue; fi
             val="$(unit_env "TEP_${key}")" || continue
             printf -v "$key" '%s' "$val"
@@ -416,6 +449,7 @@ load_unit_config() {
     # works from a parsed curve, so 'curve' and 'config' do not silently report
     # zero steps on a machine where nothing is installed yet.
     parse_curve
+    _check_stop warn
     return 0
 }
 
@@ -433,6 +467,7 @@ Environment=TEP_HYST=${HYST}
 Environment=TEP_INTERVAL=${INTERVAL}
 Environment=TEP_REASSERT=${REASSERT}
 Environment="TEP_SENSORS=${SENSORS}"
+Environment=TEP_ALLOW_STOP=${ALLOW_STOP}
 ExecStart=${BIN} run
 # Belt and braces with the daemon's own trap: stopping the service must never
 # leave the fans pinned at whatever duty was last set.
@@ -464,10 +499,10 @@ _install_as_root() {
 
 cmd_run() {
     [[ -x "$ECTOOL" ]] || error_exit "${ECTOOL} not found — install the host's EC tooling (ectool)."
-    parse_curve
 
     # The fans must go back to the EC however this process ends, including a
-    # systemd stop or a crash in the loop.
+    # systemd stop, a crash in the loop, or a curve refused just below — a
+    # restart with a bad curve must not leave a previous duty pinned.
     #
     # Two traps, not one: a TERM handler that only cleans up does NOT end the
     # process — bash runs it and then resumes the loop — so `systemctl stop`
@@ -476,6 +511,9 @@ cmd_run() {
     # whichever way the loop ends.
     trap '_ec autofanctrl >/dev/null 2>&1 || true' EXIT
     trap 'exit 0' INT TERM
+
+    parse_curve
+    _check_stop refuse
 
     info "curve: ${CURVE} (hysteresis ${HYST}C, every ${INTERVAL}s, sensors: ${SENSORS})"
 
@@ -521,6 +559,7 @@ cmd_once() {
 cmd_simulate() {
     (( $# )) || error_exit "simulate needs temperatures, e.g. simulate 68 75 85"
     parse_curve
+    _check_stop warn
     local s=-1 t
     for t in "$@"; do
         [[ "$t" =~ ^(-?)([0-9]{1,6})$ ]] || error_exit "not a temperature: ${t}"
@@ -587,6 +626,7 @@ cmd_config() {
     printf 'interval=%s\n'      "$INTERVAL"
     printf 'reassert=%s\n'      "$REASSERT"
     printf 'sensors=%s\n'       "$SENSORS"
+    printf 'allow_stop=%s\n'    "$ALLOW_STOP"
     printf 'ectool=%s\n'        "$ECTOOL"
     printf 'ectool_exists=%d\n' "$([[ -x "$ECTOOL" ]] && echo 1 || echo 0)"
     printf 'hwmon=%s\n'         "$HWMON_ROOT"
@@ -632,6 +672,7 @@ cmd_status() {
 
 cmd_install() {
     parse_curve
+    _check_stop refuse
     [[ -x "$ECTOOL" ]] || warn "${ECTOOL} not found — install the host's EC tooling before starting the service."
 
     # Two fan daemons both writing the EC's single duty register fight, and the
@@ -704,6 +745,32 @@ cmd_uninstall() {
     success "removed ${UNIT} and ${BIN}"
 }
 
+# _set_env_line KEY LINE — copy a unit from stdin to stdout with KEY's
+# Environment= line replaced by LINE (the first one; later duplicates are
+# dropped). With none, LINE goes right after the [Service] header — appending
+# it at the end of the file would put it under [Install], where systemd
+# ignores it.
+_set_env_line() {
+    local key="$1" new="$2" line has_key=0 done_once=0
+    local -a buf=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        buf+=("$line")
+        [[ "$line" == "Environment=\"${key}="* || "$line" == "Environment=${key}="* ]] && has_key=1
+    done
+    for line in ${buf[@]+"${buf[@]}"}; do
+        if [[ "$line" == "Environment=\"${key}="* || "$line" == "Environment=${key}="* ]]; then
+            (( done_once )) || printf '%s\n' "$new"
+            done_once=1
+            continue
+        fi
+        printf '%s\n' "$line"
+        if (( ! has_key && ! done_once )) && [[ "$line" == "[Service]" ]]; then
+            printf '%s\n' "$new"; done_once=1
+        fi
+    done
+    (( done_once )) || printf '%s\n' "$new"
+}
+
 cmd_set_curve() {
     (( $# )) || error_exit "set-curve needs points, e.g. set-curve '70:40 80:100'"
     [[ -f "$UNIT" ]] || error_exit "no unit at ${UNIT} — run 'install' first."
@@ -712,6 +779,7 @@ cmd_set_curve() {
     # must leave the running service exactly as it was.
     CURVE="$*"
     parse_curve
+    _check_stop refuse
 
     if (( DRY_RUN )); then
         info "would set CURVE=${CURVE} in ${UNIT} and restart ${SERVICE}"
@@ -720,18 +788,11 @@ cmd_set_curve() {
 
     # Rewrite in place rather than re-render: the unit may carry edits (a
     # different interval, an added dependency) that a full rewrite would drop.
-    local line done_once=0 out
-    out="$(
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            if [[ "$line" == Environment=\"TEP_CURVE=* || "$line" == Environment=TEP_CURVE=* ]]; then
-                (( done_once )) && continue
-                printf 'Environment="TEP_CURVE=%s"\n' "$CURVE"; done_once=1
-            else
-                printf '%s\n' "$line"
-            fi
-        done < "$UNIT"
-        (( done_once )) || printf 'Environment="TEP_CURVE=%s"\n' "$CURVE"
-    )"
+    # TEP_ALLOW_STOP travels with the curve: a unit that allowed a stop for its
+    # old curve must not silently allow one for the next.
+    local out
+    out="$(_set_env_line TEP_CURVE "Environment=\"TEP_CURVE=${CURVE}\"" < "$UNIT" \
+        | _set_env_line TEP_ALLOW_STOP "Environment=TEP_ALLOW_STOP=${ALLOW_STOP}")"
     printf '%s\n' "$out" | _install_as_root 644 "$UNIT" || error_exit "could not write ${UNIT}"
     success "curve set to ${CURVE}"
 
@@ -752,6 +813,7 @@ validate_numbers() {
         [[ "${!n}" =~ ^[0-9]{1,6}$ ]] || error_exit "--${n,,} must be a non-negative integer (got '${!n}')"
         printf -v "$n" '%s' "$(_dec "${!n}")"
     done
+    [[ "$ALLOW_STOP" =~ ^[01]$ ]] || error_exit "TEP_ALLOW_STOP must be 0 or 1 (got '${ALLOW_STOP}')"
     (( INTERVAL >= 1 )) || error_exit "--interval must be at least 1 second"
     (( INTERVAL <= MAX_INTERVAL )) \
         || error_exit "--interval must be at most ${MAX_INTERVAL} seconds (got ${INTERVAL}) — a slower loop cannot follow a loaded SoC"
@@ -783,6 +845,7 @@ main() {
             --bin=*)      BIN="${1#*=}";         shift ;;
             --unit)       [[ $# -ge 2 ]] || error_exit "--unit needs PATH";     UNIT="$2";       shift 2 ;;
             --unit=*)     UNIT="${1#*=}";        shift ;;
+            --allow-stop) ALLOW_STOP=1; FROM_ENV[ALLOW_STOP]=1; shift ;;
             --force)      FORCE=1;      shift ;;
             --dry-run)    DRY_RUN=1;    shift ;;
             -y|--yes)     ASSUME_YES=1; shift ;;

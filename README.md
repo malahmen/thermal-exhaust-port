@@ -94,6 +94,15 @@ $ ./thermal-exhaust-port.sh simulate --curve "72:35 78:60 84:85 88:100" 71 72 79
 
 `simulate` touches no hardware, so try a curve before installing it.
 
+**A fan never cools less as it gets hotter.** Duties may not fall from one step
+to the next — `72:60 80:20` (20% at 85 °C) is refused, naming the point. That
+leaves 0% (fans stopped) possible only on the coolest steps, and even there it
+stops fans that the EC's own control, below the first point, keeps turning:
+`60:0 90:100` stops them from 60 °C until 90 °C. `run`, `install` and
+`set-curve` refuse such a curve unless `--allow-stop` says the fans may stop
+(the unit records it as `TEP_ALLOW_STOP=1`, and `set-curve` without the flag
+resets it); `simulate` warns. The same rules as carbonite.
+
 ## Tuning
 
 | Flag | `TEP_*` | Default | Meaning |
@@ -103,6 +112,7 @@ $ ./thermal-exhaust-port.sh simulate --curve "72:35 78:60 84:85 88:100" 71 72 79
 | `--interval` | `TEP_INTERVAL` | `3` | seconds between checks, 1-60: a loaded SoC climbs tens of degrees in a few seconds |
 | `--reassert` | `TEP_REASSERT` | `60` | seconds; re-send the current state |
 | `--sensors` | `TEP_SENSORS` | `k10temp amdgpu` | hwmon names to watch, hottest wins |
+| `--allow-stop` | `TEP_ALLOW_STOP=1` | off | let a curve start with 0% steps (fans stopped) |
 | `--ectool` | `TEP_ECTOOL` | `/usr/bin/ectool` | the EC tool |
 | `--hwmon` | `TEP_HWMON` | `/sys/class/hwmon` | sysfs hwmon root |
 | `--unit-dirs` | `TEP_UNIT_DIRS` | the four systemd dirs | where `conflicts` looks for unit files |
@@ -116,8 +126,9 @@ Change the curve of a running service without editing the unit by hand:
 ```
 
 It validates the new curve **before** touching the file, rewrites only the
-`CURVE=` line — so an interval or a dependency you added by hand survives — and
-restarts the service only if it was already running.
+`TEP_CURVE=` and `TEP_ALLOW_STOP=` lines — so an interval or a dependency you
+added by hand survives; a missing line goes under `[Service]` — and restarts
+the service only if it was already running.
 
 ## Where the configuration lives
 
@@ -128,7 +139,7 @@ the CLI and ignored by the service: two sources of truth that disagree exactly
 when it matters.
 
 The unit sets the **`TEP_`-prefixed** names — `TEP_CURVE`, `TEP_HYST`,
-`TEP_INTERVAL`, `TEP_REASSERT`, `TEP_SENSORS` — because those are the ones the
+`TEP_INTERVAL`, `TEP_REASSERT`, `TEP_SENSORS`, `TEP_ALLOW_STOP` — because those are the ones the
 daemon reads from its environment. These must stay in step: a unit that sets a
 name the daemon ignores makes the service run its defaults while `status`
 reports the unit's curve, which is the worst of both. `tests/test-run.sh`

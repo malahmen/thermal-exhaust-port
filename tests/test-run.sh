@@ -61,6 +61,18 @@ wait_last() {
     return 1
 }
 
+# run_for SECS LOG CMD... — a command that must END on its own (a refusal),
+# bounded: a regression that starts the loop instead fails the check rather
+# than hanging the suite. 124 when it had to be killed.
+run_for() {
+    local secs="$1" log="$2" p i=0; shift 2
+    "$@" >"$log" 2>&1 &
+    p=$!
+    while kill -0 "$p" 2>/dev/null && (( i < secs * 10 )); do sleep 0.1; i=$(( i + 1 )); done
+    if kill -0 "$p" 2>/dev/null; then kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; fi
+    wait "$p"
+}
+
 echo "## 1. the loop applies the curve"
 
 settemp 71
@@ -164,7 +176,7 @@ kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
 check "every Environment key is a TEP_ one the engine reads" bash -c '
     while IFS= read -r l; do
         k="${l#Environment=}"; k="${k#\"}"; k="${k%%=*}"
-        case "$k" in TEP_CURVE|TEP_HYST|TEP_INTERVAL|TEP_REASSERT|TEP_SENSORS) ;;
+        case "$k" in TEP_CURVE|TEP_HYST|TEP_INTERVAL|TEP_REASSERT|TEP_SENSORS|TEP_ALLOW_STOP) ;;
             *) echo "unread key in unit: $k" >&2; exit 1 ;;
         esac
     done < "'"$T"'/envlines"'
@@ -175,6 +187,33 @@ out="$(TEP_SUDO="" bash "$E" run --ectool "$T/stub/nope" --hwmon "$T/hwmon" \
         --sensors k10temp --unit "$T/none.service" 2>&1)" && rc=0 || rc=$?
 check "a missing ectool is a startup failure" [ "${rc:-0}" != "0" ]
 check "and it says which binary is missing"   grep -q 'nope' <<< "$out"
+
+echo "## 7. a curve that cools less when hot never runs"
+
+# The daemon is the last line: whatever wrote its environment (a hand-edited
+# unit, a drop-in), it refuses such a curve — and hands the fans back to the
+# EC on the way out, so a restart does not leave the previous duty pinned.
+settemp 70
+: > "$CALLS"
+run_for 5 "$T/refuse.log" env TEP_SUDO="" bash "$E" run --curve "60:0 90:100" --interval 1 \
+    --sensors k10temp --hwmon "$T/hwmon" --ectool "$T/stub/ectool" && rc=0 || rc=$?
+check "a leading 0% curve is refused by run"   [ "$rc" = "1" ]
+check "  saying the fans would stop"           grep -q 'STOPS the fans' "$T/refuse.log"
+check "  no 0% is ever sent"                   [ "$(count 'fanduty 0')" = "0" ]
+check "  and the fans are handed back"         [ "$(count autofanctrl)" -ge 1 ]
+
+: > "$CALLS"
+run_for 5 "$T/refuse.log" env TEP_SUDO="" bash "$E" run --curve "72:60 80:20" --interval 1 \
+    --sensors k10temp --hwmon "$T/hwmon" --ectool "$T/stub/ectool" && rc=0 || rc=$?
+check "a falling curve is refused by run"      [ "$rc" = "1" ]
+check "  and nothing but the hand-back is sent" [ "$(calls)" = "autofanctrl" ]
+
+: > "$CALLS"
+TEP_SUDO="" TEP_ALLOW_STOP=1 bash "$E" run --curve "60:0 90:100" --interval 1 --sensors k10temp \
+    --hwmon "$T/hwmon" --ectool "$T/stub/ectool" >/dev/null 2>&1 &
+PID=$!
+check "TEP_ALLOW_STOP=1 (the unit's form) lets it run" wait_for "fanduty 0"
+kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

@@ -155,6 +155,14 @@ check "but the engine copy is refreshed"   cmp -s "$E" "$BIN"
 run install --force --curve "99:10"
 check "--force rewrites the curve"         inunit 'Environment="TEP_CURVE=99:10"'
 check "--force drops hand-added lines"     notunit 'MARKER=keepme'
+before="$(cat "$UNIT")"
+check "install refuses a falling-duty curve" nq install --force --curve "72:60 80:20"
+check "install refuses a leading-0% curve"   nq install --force --curve "60:0 90:100"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+run install --force --curve "60:0 90:100" --allow-stop
+check "install --allow-stop writes the permission" inunit 'Environment=TEP_ALLOW_STOP=1'
+run install --force --curve "99:10"
+check "a plain install writes TEP_ALLOW_STOP=0"    inunit 'Environment=TEP_ALLOW_STOP=0'
 
 echo "## 5. set-curve edits in place"
 
@@ -178,6 +186,35 @@ before="$(cat "$UNIT")"
 check "a bad curve is refused"             nq set-curve "80:50 70:40"
 check "and the unit is untouched"          [ "$(cat "$UNIT")" = "$before" ]
 check "set-curve with no points is refused" nq set-curve
+
+# A fan must never cool less as it gets hotter (Kamino item 183).
+check "a falling-duty curve is refused"    nq set-curve "72:60 80:20"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+check "a leading-0% curve is refused"      nq set-curve "60:0 90:100"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+run set-curve "60:0 90:100" --allow-stop
+check "--allow-stop lets it through"       inunit 'Environment="TEP_CURVE=60:0 90:100"'
+check "  and records the permission in the unit" inunit 'Environment=TEP_ALLOW_STOP=1'
+check "  config reports it"                [ "$(cfg allow_stop)" = "1" ]
+run set-curve "60:30 90:100"
+check "the next curve does not inherit it" inunit 'Environment=TEP_ALLOW_STOP=0'
+check "  exactly one ALLOW_STOP line"      [ "$(grep -cF 'TEP_ALLOW_STOP=' "$UNIT")" = "1" ]
+
+# A unit without the key (hand-written, or from before it existed): the line
+# belongs in [Service]. Appended at the end of the file it lands under
+# [Install], where systemd ignores it.
+printf '[Unit]\nDescription=x\n\n[Service]\nExecStart=/bin/true\n\n[Install]\nWantedBy=multi-user.target\n' > "$UNIT"
+run set-curve "60:0 90:100" --allow-stop
+svc_end="$(grep -n '^\[Install\]' "$UNIT" | cut -d: -f1)"
+check "missing keys are added under [Service], not [Install]" bash -c '
+    for k in TEP_CURVE TEP_ALLOW_STOP; do
+        n="$(grep -n "$k=" "$1" | cut -d: -f1)"; [[ -n "$n" ]] && (( n < $2 )) || exit 1
+    done' _ "$UNIT" "$svc_end"
+# A unit whose curve stops the fans without the permission (a hand edit): the
+# reports say the service will refuse it.
+printf '[Service]\nEnvironment="TEP_CURVE=60:0 90:100"\n' > "$UNIT"
+check "config warns about a unit's 0% curve" grep -q 'refuse it without --allow-stop' <<< "$(Q config 2>&1 >/dev/null)"
+printf '%s\n' "$before" > "$UNIT"
 
 echo "## 6. uninstall"
 
