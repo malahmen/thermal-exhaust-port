@@ -85,8 +85,18 @@ dbg()        { if (( VERBOSE )); then printf '%s[debug] %s\n' "$(_pfx)" "$*" >&2
 CURVE="${TEP_CURVE:-72:35 78:60 84:85 88:100}"
 HYST="${TEP_HYST:-4}"             # degC to fall below a step before dropping to it
 INTERVAL="${TEP_INTERVAL:-3}"     # seconds between temperature checks
+# The cap on --interval: a loaded SoC climbs tens of degrees in a few seconds,
+# and a loop that looks less often than once a minute is not controlling it.
+MAX_INTERVAL=60
 REASSERT="${TEP_REASSERT:-60}"    # seconds; re-send the current state to the EC
+# Failed reads in a row before the daemon stops holding the last duty and hands
+# the fans back to the EC: long enough to ride out a driver rebinding, short
+# enough that a blind loop does not hold a low duty on a machine heating up.
+BLIND_READS=3
 SENSORS="${TEP_SENSORS:-k10temp amdgpu}"  # hwmon names to watch, hottest wins
+# A step at 0% stops the fans while the machine is hotter than where the EC's
+# own control keeps them turning; refused unless this says it is meant.
+ALLOW_STOP="${TEP_ALLOW_STOP:-0}"
 
 ECTOOL="${TEP_ECTOOL:-/usr/bin/ectool}"
 HWMON_ROOT="${TEP_HWMON:-/sys/class/hwmon}"
@@ -109,7 +119,7 @@ ASSUME_YES=0
 # Which knobs were given explicitly (flag or TEP_* variable)? An explicit value
 # always wins over what the installed unit says; see load_unit_config.
 declare -A FROM_ENV=()
-for _k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS; do
+for _k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS TEP_ALLOW_STOP TEP_ECTOOL TEP_HWMON; do
     [[ -n "${!_k+set}" ]] && FROM_ENV["${_k#TEP_}"]=1
 done
 unset _k
@@ -149,9 +159,11 @@ COMMANDS
 FLAGS
   --curve POINTS           "degC:duty%" points, ascending (default: ${CURVE})
   --hyst N                 degC to fall below a step before dropping to it (default: ${HYST})
-  --interval N             seconds between temperature checks (default: ${INTERVAL})
+  --interval N             seconds between temperature checks, 1-${MAX_INTERVAL} (default: ${INTERVAL})
   --reassert N             seconds; re-send the current state to the EC (default: ${REASSERT})
   --sensors "NAME..."      hwmon names to watch, hottest wins (default: ${SENSORS})
+  --allow-stop             let a curve start with 0% steps (fans stopped); without
+                           it run, install and set-curve refuse such a curve
   --ectool PATH            ectool binary (default: ${ECTOOL})
   --hwmon DIR              sysfs hwmon root (default: ${HWMON_ROOT})
   --unit-dirs "DIR..."     where the conflict scan looks for unit files
@@ -168,6 +180,11 @@ THE CURVE
   temperature the hottest watched sensor has reached. Below the first point the
   EC's own control is handed back (ectool autofanctrl).
 
+  A fan must never cool less as it gets hotter, so duties may not fall from one
+  step to the next ("72:60 80:20" is refused), and 0% — fans stopped — can only
+  be the coolest steps. Even there it stops fans the EC would keep turning, so
+  run, install and set-curve refuse it without --allow-stop; simulate warns.
+
   Hysteresis is one-sided: a step is entered at its temperature but only left
   once the temperature falls HYST degrees below it, so a machine hovering on a
   threshold does not oscillate. 'once' reports the duty for a COLD START and can
@@ -181,6 +198,11 @@ CONFIGURATION
   CLI and ignored by the service. 'status', 'once' and 'config' read the unit;
   'set-curve' rewrites it. An explicit flag or TEP_* variable overrides it.
   'simulate' deliberately ignores the unit — it is the "what if" command.
+
+  Drop-ins count, as systemd applies them (<unit>.d/*.conf and <dir>/<unit>.d/
+  in each unit directory; last assignment wins). 'set-curve' refuses when a
+  drop-in sets TEP_CURVE or TEP_ALLOW_STOP, and names it: that is the file to
+  edit. EnvironmentFile= is not read.
 
   Nothing is installed for you: ectool comes from the host's firmware tooling
   (on Bazzite it is already there), and a missing one is reported.
@@ -208,22 +230,53 @@ EOF
 # Curve
 # -----------------------------------------------------------------------------
 
+# Numbers are read as decimal, always. Bash arithmetic takes a leading zero as
+# octal: "072:35" became a step at 58C, "090" a misleading "must ascend", and
+# --hyst 08 passed the regex and then broke every step-down comparison, so the
+# fan never stepped down. Six digits is far past any real value and keeps a
+# typo from overflowing the arithmetic.
+_dec() { printf '%d' "$(( 10#$1 ))"; }
+
 CT=() CD=()
 parse_curve() {
-    local pt last=-1
+    local pt t d last=-1 lastd=0
     CT=(); CD=()
     for pt in $CURVE; do
-        [[ "$pt" =~ ^([0-9]+):([0-9]+)$ ]] \
+        [[ "$pt" =~ ^([0-9]{1,6}):([0-9]{1,6})$ ]] \
             || error_exit "bad curve point '${pt}' — want degC:duty%, e.g. 72:35"
-        (( BASH_REMATCH[2] <= 100 )) \
+        t="$(_dec "${BASH_REMATCH[1]}")"; d="$(_dec "${BASH_REMATCH[2]}")"
+        (( d <= 100 )) \
             || error_exit "duty out of range in '${pt}' — 0-100"
-        (( BASH_REMATCH[1] > last )) \
+        (( t > last )) \
             || error_exit "curve must ascend by temperature: '${pt}' follows ${last}C"
-        last="${BASH_REMATCH[1]}"
-        CT+=("${BASH_REMATCH[1]}")
-        CD+=("${BASH_REMATCH[2]}")
+        # The fan must never cool less as it gets hotter. Non-falling duties also
+        # confine 0% to the leading steps; _check_stop deals with those.
+        (( d >= lastd )) \
+            || error_exit "duty must not fall as it gets hotter: '${pt}' is ${d}% after ${lastd}%"
+        last="$t"; lastd="$d"
+        CT+=("$t")
+        CD+=("$d")
     done
     (( ${#CT[@]} )) || error_exit "empty curve"
+}
+
+# _check_stop refuse|warn — a curve whose first steps are 0% stops the fans
+# from the first point up, where below it the EC's own control keeps them
+# turning: hotter, and cooled less. Refused for anything that applies a curve
+# unless --allow-stop (TEP_ALLOW_STOP=1) says the fans may stop; reports warn.
+_check_stop() {
+    local i from to="" where
+    (( ${#CD[@]} )) && (( CD[0] == 0 )) || return 0
+    from="${CT[0]}"
+    for (( i = 1; i < ${#CD[@]}; i++ )); do
+        (( CD[i] == 0 )) || { to="${CT[i]}"; break; }
+    done
+    where="from ${from}C ${to:+until ${to}C}${to:-up}"
+    (( ALLOW_STOP )) && { dbg "0% ${where} allowed by --allow-stop"; return 0; }
+    if [[ "$1" == refuse ]]; then
+        error_exit "the curve forces 0% ${where}, which STOPS the fans there — below ${from}C the EC's own control keeps them turning. Raise those steps, or pass --allow-stop if the fans may stop."
+    fi
+    warn "this curve forces 0% ${where}, which stops the fans there; run, install and set-curve refuse it without --allow-stop"
 }
 
 # decide TEMP CURRENT_STEP — echoes the new step. -1 means "let the EC decide".
@@ -247,34 +300,39 @@ label() { if (( $1 < 0 )); then printf 'auto (EC)'; else printf '%s%%' "${CD[$1]
 # hwmon indices are not stable across reboots — a driver loading in a different
 # order renumbers them — so sensors are resolved by name on every read. A
 # hardcoded hwmon6 silently starts reading the wrong chip after a kernel update.
-_sensor_dirs() {
-    local want d
+#
+# _scan sets HOT to the hottest watched sensor in whole degrees, or "" (and
+# returns 1) when none could be read; FOUND to the watched names that gave a
+# reading, so the daemon can say when a chip drops out. "" is not 0: a failed
+# read must never look like a cold machine, because the curve would hand the
+# fans back to the EC on the strength of it.
+HOT="" FOUND=""
+_scan() {
+    local hi="" want d f v got
+    FOUND=""
     for want in $SENSORS; do
         for d in "$HWMON_ROOT"/hwmon*; do
             [[ -r "$d/name" ]] || continue
             [[ "$(<"$d/name")" == "$want" ]] || continue
-            printf '%s\n' "$d"
+            got=0
+            for f in "$d"/temp*_input; do
+                [[ -r "$f" ]] || continue
+                v="$(<"$f")" || continue
+                [[ "$v" =~ ^(-?)([0-9]{1,9})$ ]] || continue
+                v="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
+                got=1
+                if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
+            done
+            (( got )) && FOUND+="${FOUND:+ }${want}"
             break
         done
     done
+    HOT=""
+    [[ -n "$hi" ]] || return 1
+    HOT="$(( hi / 1000 ))"
 }
 
-# Echoes the hottest watched sensor in whole degrees, or "" when none could be
-# read. "" is not 0: a failed read must never look like a cold machine, because
-# the curve would hand the fans back to the EC on the strength of it.
-hottest() {
-    local hi="" d f v
-    while IFS= read -r d; do
-        for f in "$d"/temp*_input; do
-            [[ -r "$f" ]] || continue
-            v="$(<"$f")" || continue
-            [[ "$v" =~ ^-?[0-9]+$ ]] || continue
-            if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
-        done
-    done < <(_sensor_dirs)
-    [[ -n "$hi" ]] || return 1
-    printf '%s\n' $(( hi / 1000 ))
-}
+hottest() { _scan || return 1; printf '%s\n' "$HOT"; }
 
 # -----------------------------------------------------------------------------
 # EC
@@ -306,23 +364,93 @@ apply() {
 # Unit as configuration
 # -----------------------------------------------------------------------------
 
-# Echoes the value of Environment=KEY= from the unit; the last one wins, as
-# systemd does. Parsed here rather than by eval-ing `systemctl show -p
-# Environment`, whose output is shell-quoted: eval on a root-owned file that
-# people hand-edit is a code-injection path for no benefit.
-unit_env() {
-    local key="$1" line val out=""
-    [[ -r "$UNIT" ]] || return 1
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" == Environment=* ]] || continue
-        val="${line#Environment=}"
-        val="${val%\"}"; val="${val#\"}"
-        [[ "$val" == "$key="* ]] || continue
-        out="${val#"$key="}"
-    done < "$UNIT"
-    [[ -n "$out" ]] || return 1
-    printf '%s\n' "$out"
+# The files systemd reads for this unit, in the order it applies them: the
+# unit itself, then its drop-ins — <unit>.d/ beside it, and <dir>/<name>.d/ in
+# each unit directory. A drop-in name in an earlier directory masks the same
+# name in a later one (/etc over /run over /usr/lib), and drop-ins apply sorted
+# by file name across all directories. `systemctl edit` writes one of these,
+# and before, status, config and set-curve never looked: they reported a curve
+# a drop-in had replaced, and set-curve rewrote a line that no longer counted.
+_unit_files() {
+    [[ -r "$UNIT" ]] || return 0
+    printf '%s\n' "$UNIT"
+    local d f b
+    local -a dirs=("${UNIT}.d")
+    local -A by_name=()
+    for d in $UNIT_DIRS; do dirs+=("${d}/${SERVICE}.d"); done
+    for d in "${dirs[@]}"; do
+        for f in "$d"/*.conf; do
+            [[ -r "$f" ]] || continue
+            b="${f##*/}"
+            [[ -n "${by_name[$b]+set}" ]] || by_name[$b]="$f"
+        done
+    done
+    (( ${#by_name[@]} )) || return 0
+    while IFS= read -r b; do
+        printf '%s\n' "${by_name[$b]}"
+    done < <(printf '%s\n' "${!by_name[@]}" | LC_ALL=C sort)
 }
+
+# _env_assignments VALUE — the assignments in one Environment= value, one per
+# line, split and unquoted as systemd does: words on whitespace, "..." and
+# '...' quote, a backslash takes the next character literally. One line can
+# carry several (Environment="A=1" "B=2").
+_env_assignments() {
+    local s="$1" w="" q="" c i have=0
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == '\' ]] && (( i + 1 < ${#s} )); then
+            i=$(( i + 1 )); w+="${s:i:1}"; have=1
+        elif [[ -n "$q" ]]; then
+            if [[ "$c" == "$q" ]]; then q=""; else w+="$c"; fi
+        elif [[ "$c" == '"' || "$c" == "'" ]]; then
+            q="$c"; have=1
+        elif [[ "$c" == [[:space:]] ]]; then
+            (( have )) && printf '%s\n' "$w"
+            w=""; have=0
+        else
+            w+="$c"; have=1
+        fi
+    done
+    (( have )) && printf '%s\n' "$w"
+    return 0
+}
+
+# _unit_env_scan KEY [FILE] — what the service's environment ends up with for
+# KEY, across the unit and its drop-ins (or FILE alone): the last assignment
+# wins and an empty "Environment=" clears everything before it, both as in
+# systemd; only [Service] counts. Sets UE_VAL, and UE_SRC to the file that
+# decided it ("" if nothing did). Returns 1 when KEY ends up unset or empty.
+#
+# Parsed here rather than by eval-ing `systemctl show -p Environment`, whose
+# output is shell-quoted: eval on a root-owned file that people hand-edit is a
+# code-injection path for no benefit. Not read: EnvironmentFile=.
+UE_VAL="" UE_SRC=""
+_unit_env_scan() {
+    local key="$1" f line sect val a
+    UE_VAL=""; UE_SRC=""
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        sect=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            if [[ "$line" == \[*\] ]]; then sect="$line"; continue; fi
+            [[ "$sect" == "[Service]" ]] || continue
+            [[ "$line" =~ ^Environment[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+            val="${BASH_REMATCH[1]}"
+            if [[ -z "$val" ]]; then UE_VAL=""; UE_SRC="$f"; continue; fi
+            while IFS= read -r a; do
+                [[ "$a" == "${key}="* ]] || continue
+                UE_VAL="${a#"${key}="}"; UE_SRC="$f"
+            done < <(_env_assignments "$val")
+        done < "$f"
+    done < <(if [[ -n "${2:-}" ]]; then printf '%s\n' "$2"; else _unit_files; fi)
+    [[ -n "$UE_VAL" ]]
+}
+
+# Echoes the value KEY ends up with (see _unit_env_scan).
+unit_env() { _unit_env_scan "$1" || return 1; printf '%s\n' "$UE_VAL"; }
 
 # Another process forcing a duty is invisible after the fact: the EC has one
 # duty register, no record of who wrote it, and this firmware answers
@@ -380,16 +508,30 @@ CONFIG_SRC="defaults"
 # "what is my machine doing" commands answer about the running service instead
 # of about this script's defaults.
 load_unit_config() {
-    local key val seen=0 overridden=0
+    local key var val seen=0 overridden=0 src
+    local -a dropins=()
     if [[ -r "$UNIT" ]]; then
         # TEP_-prefixed, matching what the daemon reads from its environment.
         # These MUST be the same names render_unit writes: a unit setting a key
         # the daemon ignores makes `status` report a curve that is not running.
-        for key in CURVE HYST INTERVAL REASSERT SENSORS; do
-            if [[ -n "${FROM_ENV[$key]:-}" ]]; then overridden=1; continue; fi
-            val="$(unit_env "TEP_${key}")" || continue
-            printf -v "$key" '%s' "$val"
+        # KEY:VARIABLE, since TEP_HWMON lands in HWMON_ROOT.
+        for key in CURVE HYST INTERVAL REASSERT SENSORS ALLOW_STOP ECTOOL HWMON:HWMON_ROOT; do
+            var="${key#*:}"; key="${key%%:*}"
+            _unit_env_scan "TEP_${key}" || true
+            val="$UE_VAL"
+            # An explicit value wins; it is an override only where it differs
+            # from what the unit says.
+            if [[ -n "${FROM_ENV[$key]:-}" ]]; then
+                [[ -n "$val" && "$val" != "${!var}" ]] && overridden=1
+                continue
+            fi
+            [[ -n "$val" ]] || continue
+            printf -v "$var" '%s' "$val"
             seen=1
+            if [[ "$UE_SRC" != "$UNIT" ]]; then
+                for src in ${dropins[@]+"${dropins[@]}"}; do [[ "$src" == "$UE_SRC" ]] && continue 2; done
+                dropins+=("$UE_SRC")
+            fi
         done
         # A unit from before the prefix sets CURVE=, which the daemon does not
         # read: it would run defaults while this reported the unit's curve.
@@ -397,12 +539,31 @@ load_unit_config() {
             warn "${UNIT} sets CURVE= but the service reads TEP_CURVE= — it is running defaults. Re-run: install --force"
         fi
         (( seen )) && CONFIG_SRC="$UNIT"
+        for src in ${dropins[@]+"${dropins[@]}"}; do CONFIG_SRC+=" + ${src}"; done
         (( overridden )) && CONFIG_SRC="${CONFIG_SRC} + overrides"
+        validate_numbers
     fi
     # Always, even with no unit to read: every caller of this function then
     # works from a parsed curve, so 'curve' and 'config' do not silently report
     # zero steps on a machine where nothing is installed yet.
     parse_curve
+    _check_stop warn
+    return 0
+}
+
+# The paths go into Environment= and ExecStopPost= verbatim. systemd expands
+# '%' specifiers and '$' variables there and splits ExecStopPost on whitespace,
+# and the service's working directory is /, so a relative path would point
+# somewhere else: such a path is refused rather than written into a unit that
+# runs something other than what was asked.
+_check_unit_paths() {
+    local n v
+    for n in ECTOOL HWMON_ROOT BIN; do
+        v="${!n}"
+        [[ "$v" == /* ]] || error_exit "${n,,} must be an absolute path for the unit (got '${v}')"
+        [[ "$v" =~ [[:space:]\"\'\\%\$] ]] \
+            && error_exit "${n,,} '${v}' has a character systemd would reinterpret in a unit (space, quote, backslash, % or \$)"
+    done
     return 0
 }
 
@@ -420,6 +581,9 @@ Environment=TEP_HYST=${HYST}
 Environment=TEP_INTERVAL=${INTERVAL}
 Environment=TEP_REASSERT=${REASSERT}
 Environment="TEP_SENSORS=${SENSORS}"
+Environment=TEP_ALLOW_STOP=${ALLOW_STOP}
+Environment="TEP_ECTOOL=${ECTOOL}"
+Environment="TEP_HWMON=${HWMON_ROOT}"
 ExecStart=${BIN} run
 # Belt and braces with the daemon's own trap: stopping the service must never
 # leave the fans pinned at whatever duty was last set.
@@ -451,10 +615,10 @@ _install_as_root() {
 
 cmd_run() {
     [[ -x "$ECTOOL" ]] || error_exit "${ECTOOL} not found — install the host's EC tooling (ectool)."
-    parse_curve
 
     # The fans must go back to the EC however this process ends, including a
-    # systemd stop or a crash in the loop.
+    # systemd stop, a crash in the loop, or a curve refused just below — a
+    # restart with a bad curve must not leave a previous duty pinned.
     #
     # Two traps, not one: a TERM handler that only cleans up does NOT end the
     # process — bash runs it and then resumes the loop — so `systemctl stop`
@@ -464,29 +628,57 @@ cmd_run() {
     trap '_ec autofanctrl >/dev/null 2>&1 || true' EXIT
     trap 'exit 0' INT TERM
 
+    parse_curve
+    _check_stop refuse
+
     info "curve: ${CURVE} (hysteresis ${HYST}C, every ${INTERVAL}s, sensors: ${SENSORS})"
 
-    local step=-1 applied=-2 last=0 temp now warned=0
+    local step=-1 applied=-2 last=0 temp now blind=0 had="$SENSORS" first=1 n
     while :; do
-        if ! temp="$(hottest)"; then
-            # Not fatal and not treated as cold: hold the current duty and say
-            # so once, rather than handing a hot machine back to the EC because
-            # a driver unbound for a moment.
-            (( warned )) || { warn "no readable sensor among: ${SENSORS} — holding $(label "$step")"; warned=1; }
-            sleep "$INTERVAL"
-            continue
-        fi
-        warned=0
+        if _scan; then temp="$HOT"; else temp=""; fi
 
-        step="$(decide "$temp" "$step")"
+        # A watched chip that stops answering is said out loud: the curve then
+        # follows the others, which may be the cooler ones.
+        if [[ "$FOUND" != "$had" ]]; then
+            for n in $had; do
+                [[ " $FOUND " == *" $n "* ]] && continue
+                if (( first )); then warn "watched sensor '${n}' not found under ${HWMON_ROOT} — the curve follows: ${FOUND:-nothing}"
+                else warn "watched sensor '${n}' is gone — the curve follows: ${FOUND:-nothing}"; fi
+            done
+            for n in $FOUND; do
+                [[ " $had " == *" $n "* ]] || info "watched sensor '${n}' is back"
+            done
+            had="$FOUND"
+        fi
+        first=0
+
+        if [[ -z "$temp" ]]; then
+            # Not treated as cold. For a moment — a driver rebinding — the
+            # current duty is held; past BLIND_READS the fans go back to the
+            # EC, whose own control reads its own sensors, rather than holding
+            # a possibly low duty on a machine nobody is watching.
+            blind=$(( blind + 1 ))
+            if (( blind < BLIND_READS )); then
+                (( blind == 1 )) && warn "no readable sensor among: ${SENSORS} — holding $(label "$step"); the EC gets the fans back after ${BLIND_READS} failed reads"
+                sleep "$INTERVAL"
+                continue
+            fi
+            (( blind == BLIND_READS )) && error "no readable sensor among: ${SENSORS} for ${BLIND_READS} reads in a row — handing the fans back to the EC until one answers"
+            step=-1; temp="no sensor: "
+        else
+            (( blind >= BLIND_READS )) && info "a watched sensor answers again (${temp}C) — the curve resumes"
+            blind=0
+            step="$(decide "$temp" "$step")"
+            temp="${temp}C"
+        fi
         now="$SECONDS"
 
         if (( step != applied )); then
             if apply "$step"; then
                 applied="$step"; last="$now"
-                printf '%s%sC -> %s\n' "$(_pfx)" "$temp" "$(label "$step")" >&2
+                printf '%s%s -> %s\n' "$(_pfx)" "$temp" "$(label "$step")" >&2
             else
-                warn "ectool refused ${temp}C -> $(label "$step"); retrying next tick"
+                warn "ectool refused ${temp} -> $(label "$step"); retrying next tick"
             fi
         elif (( now - last >= REASSERT )); then
             # The EC forgets a forced duty across suspend/resume, so the
@@ -508,9 +700,11 @@ cmd_once() {
 cmd_simulate() {
     (( $# )) || error_exit "simulate needs temperatures, e.g. simulate 68 75 85"
     parse_curve
+    _check_stop warn
     local s=-1 t
     for t in "$@"; do
-        [[ "$t" =~ ^-?[0-9]+$ ]] || error_exit "not a temperature: ${t}"
+        [[ "$t" =~ ^(-?)([0-9]{1,6})$ ]] || error_exit "not a temperature: ${t}"
+        t="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
         s="$(decide "$t" "$s")"
         printf '%s\t%s\n' "$t" "$(label "$s")"
     done
@@ -534,7 +728,8 @@ cmd_sensors() {
         for f in "$d"/temp*_input; do
             [[ -r "$f" ]] || continue
             v="$(<"$f")" || continue
-            [[ "$v" =~ ^-?[0-9]+$ ]] || continue
+            [[ "$v" =~ ^(-?)([0-9]{1,9})$ ]] || continue
+            v="${BASH_REMATCH[1]}$(_dec "${BASH_REMATCH[2]}")"
             if [[ -z "$hi" ]] || (( v > hi )); then hi="$v"; fi
         done
         watched=0
@@ -572,6 +767,7 @@ cmd_config() {
     printf 'interval=%s\n'      "$INTERVAL"
     printf 'reassert=%s\n'      "$REASSERT"
     printf 'sensors=%s\n'       "$SENSORS"
+    printf 'allow_stop=%s\n'    "$ALLOW_STOP"
     printf 'ectool=%s\n'        "$ECTOOL"
     printf 'ectool_exists=%d\n' "$([[ -x "$ECTOOL" ]] && echo 1 || echo 0)"
     printf 'hwmon=%s\n'         "$HWMON_ROOT"
@@ -617,6 +813,8 @@ cmd_status() {
 
 cmd_install() {
     parse_curve
+    _check_stop refuse
+    _check_unit_paths
     [[ -x "$ECTOOL" ]] || warn "${ECTOOL} not found — install the host's EC tooling before starting the service."
 
     # Two fan daemons both writing the EC's single duty register fight, and the
@@ -689,6 +887,32 @@ cmd_uninstall() {
     success "removed ${UNIT} and ${BIN}"
 }
 
+# _set_env_line KEY LINE — copy a unit from stdin to stdout with KEY's
+# Environment= line replaced by LINE (the first one; later duplicates are
+# dropped). With none, LINE goes right after the [Service] header — appending
+# it at the end of the file would put it under [Install], where systemd
+# ignores it.
+_set_env_line() {
+    local key="$1" new="$2" line has_key=0 done_once=0
+    local -a buf=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        buf+=("$line")
+        [[ "$line" == "Environment=\"${key}="* || "$line" == "Environment=${key}="* ]] && has_key=1
+    done
+    for line in ${buf[@]+"${buf[@]}"}; do
+        if [[ "$line" == "Environment=\"${key}="* || "$line" == "Environment=${key}="* ]]; then
+            (( done_once )) || printf '%s\n' "$new"
+            done_once=1
+            continue
+        fi
+        printf '%s\n' "$line"
+        if (( ! has_key && ! done_once )) && [[ "$line" == "[Service]" ]]; then
+            printf '%s\n' "$new"; done_once=1
+        fi
+    done
+    (( done_once )) || printf '%s\n' "$new"
+}
+
 cmd_set_curve() {
     (( $# )) || error_exit "set-curve needs points, e.g. set-curve '70:40 80:100'"
     [[ -f "$UNIT" ]] || error_exit "no unit at ${UNIT} — run 'install' first."
@@ -697,6 +921,17 @@ cmd_set_curve() {
     # must leave the running service exactly as it was.
     CURVE="$*"
     parse_curve
+    _check_stop refuse
+
+    # A drop-in applies after the unit. Rewriting the unit's line under one
+    # that sets (or clears) the same key changes nothing the service runs while
+    # reporting success — so that is refused, naming the file to edit instead.
+    local k
+    for k in TEP_CURVE TEP_ALLOW_STOP; do
+        _unit_env_scan "$k" || true
+        [[ -z "$UE_SRC" || "$UE_SRC" == "$UNIT" ]] && continue
+        error_exit "${k} is decided by the drop-in ${UE_SRC}, which systemd applies after ${UNIT}: rewriting the unit would not change what the service runs. Change it in that drop-in (or remove it there, then re-run set-curve)."
+    done
 
     if (( DRY_RUN )); then
         info "would set CURVE=${CURVE} in ${UNIT} and restart ${SERVICE}"
@@ -705,18 +940,25 @@ cmd_set_curve() {
 
     # Rewrite in place rather than re-render: the unit may carry edits (a
     # different interval, an added dependency) that a full rewrite would drop.
-    local line done_once=0 out
-    out="$(
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            if [[ "$line" == Environment=\"TEP_CURVE=* || "$line" == Environment=TEP_CURVE=* ]]; then
-                (( done_once )) && continue
-                printf 'Environment="TEP_CURVE=%s"\n' "$CURVE"; done_once=1
-            else
-                printf '%s\n' "$line"
-            fi
-        done < "$UNIT"
-        (( done_once )) || printf 'Environment="TEP_CURVE=%s"\n' "$CURVE"
-    )"
+    # TEP_ALLOW_STOP travels with the curve: a unit that allowed a stop for its
+    # old curve must not silently allow one for the next.
+    local out
+    out="$(_set_env_line TEP_CURVE "Environment=\"TEP_CURVE=${CURVE}\"" < "$UNIT" \
+        | _set_env_line TEP_ALLOW_STOP "Environment=TEP_ALLOW_STOP=${ALLOW_STOP}")"
+    # Read the result back before writing it: a line set-curve cannot rewrite
+    # (several assignments on one line, say) would otherwise keep winning.
+    local check var
+    check="$(mktemp)" || error_exit "mktemp failed"
+    printf '%s\n' "$out" > "$check"
+    for k in TEP_CURVE:CURVE TEP_ALLOW_STOP:ALLOW_STOP; do
+        var="${k#*:}"
+        _unit_env_scan "${k%%:*}" "$check" || true
+        [[ "$UE_VAL" == "${!var}" ]] && continue
+        rm -f "$check"
+        error_exit "${UNIT} would still set ${k%%:*}=${UE_VAL} on a line set-curve cannot rewrite — edit that line by hand."
+    done
+    rm -f "$check"
+
     printf '%s\n' "$out" | _install_as_root 644 "$UNIT" || error_exit "could not write ${UNIT}"
     success "curve set to ${CURVE}"
 
@@ -725,6 +967,22 @@ cmd_set_curve() {
         $SUDO "$SYSTEMCTL" restart "$SERVICE" || error_exit "restarting ${SERVICE} failed"
         success "${SERVICE} restarted"
     fi
+}
+
+# Validated in one place, so every command fails the same way on a bad number
+# instead of each one growing its own check — and called again after a unit's
+# values are adopted, which no flag parsing ever saw. Each value is rewritten
+# in decimal (see _dec).
+validate_numbers() {
+    local n
+    for n in HYST INTERVAL REASSERT; do
+        [[ "${!n}" =~ ^[0-9]{1,6}$ ]] || error_exit "--${n,,} must be a non-negative integer (got '${!n}')"
+        printf -v "$n" '%s' "$(_dec "${!n}")"
+    done
+    [[ "$ALLOW_STOP" =~ ^[01]$ ]] || error_exit "TEP_ALLOW_STOP must be 0 or 1 (got '${ALLOW_STOP}')"
+    (( INTERVAL >= 1 )) || error_exit "--interval must be at least 1 second"
+    (( INTERVAL <= MAX_INTERVAL )) \
+        || error_exit "--interval must be at most ${MAX_INTERVAL} seconds (got ${INTERVAL}) — a slower loop cannot follow a loaded SoC"
 }
 
 # -----------------------------------------------------------------------------
@@ -743,16 +1001,17 @@ main() {
             --reassert=*) REASSERT="${1#*=}";    FROM_ENV[REASSERT]=1; shift ;;
             --sensors)    [[ $# -ge 2 ]] || error_exit "--sensors needs NAMES"; SENSORS="$2";    FROM_ENV[SENSORS]=1;  shift 2 ;;
             --sensors=*)  SENSORS="${1#*=}";     FROM_ENV[SENSORS]=1;  shift ;;
-            --ectool)     [[ $# -ge 2 ]] || error_exit "--ectool needs PATH";   ECTOOL="$2";     shift 2 ;;
-            --ectool=*)   ECTOOL="${1#*=}";      shift ;;
-            --hwmon)      [[ $# -ge 2 ]] || error_exit "--hwmon needs DIR";     HWMON_ROOT="$2"; shift 2 ;;
-            --hwmon=*)    HWMON_ROOT="${1#*=}";  shift ;;
+            --ectool)     [[ $# -ge 2 ]] || error_exit "--ectool needs PATH";   ECTOOL="$2";     FROM_ENV[ECTOOL]=1; shift 2 ;;
+            --ectool=*)   ECTOOL="${1#*=}";      FROM_ENV[ECTOOL]=1; shift ;;
+            --hwmon)      [[ $# -ge 2 ]] || error_exit "--hwmon needs DIR";     HWMON_ROOT="$2"; FROM_ENV[HWMON]=1;  shift 2 ;;
+            --hwmon=*)    HWMON_ROOT="${1#*=}";  FROM_ENV[HWMON]=1;  shift ;;
             --unit-dirs)  [[ $# -ge 2 ]] || error_exit "--unit-dirs needs DIRS";  UNIT_DIRS="$2";  shift 2 ;;
             --unit-dirs=*) UNIT_DIRS="${1#*=}";  shift ;;
             --bin)        [[ $# -ge 2 ]] || error_exit "--bin needs PATH";      BIN="$2";        shift 2 ;;
             --bin=*)      BIN="${1#*=}";         shift ;;
             --unit)       [[ $# -ge 2 ]] || error_exit "--unit needs PATH";     UNIT="$2";       shift 2 ;;
             --unit=*)     UNIT="${1#*=}";        shift ;;
+            --allow-stop) ALLOW_STOP=1; FROM_ENV[ALLOW_STOP]=1; shift ;;
             --force)      FORCE=1;      shift ;;
             --dry-run)    DRY_RUN=1;    shift ;;
             -y|--yes)     ASSUME_YES=1; shift ;;
@@ -767,13 +1026,7 @@ main() {
     SERVICE="${UNIT##*/}"
     [[ "$SERVICE" == *.service ]] || error_exit "--unit must name a .service file (got '${UNIT##*/}')"
 
-    # Validated once, here, so every command fails the same way on a bad number
-    # instead of each one growing its own check.
-    local n
-    for n in HYST INTERVAL REASSERT; do
-        [[ "${!n}" =~ ^[0-9]+$ ]] || error_exit "--${n,,} must be a non-negative integer (got '${!n}')"
-    done
-    (( INTERVAL >= 1 )) || error_exit "--interval must be at least 1 second"
+    validate_numbers
 
     # `tep --curve X simulate 75` is a natural thing to type, and taking $1 as
     # the command turns it into "unknown command: --curve". Name the real

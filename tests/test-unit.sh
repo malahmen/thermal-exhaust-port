@@ -93,6 +93,13 @@ called() { grep -qF "$1" "$CALLS"; }
 missing(){ ! grep -qF "$1" "$CALLS"; }
 inunit() { grep -qF "$1" "$UNIT"; }
 notunit(){ ! grep -qF "$1" "$UNIT"; }
+# addenv LINE [FILE] — add LINE at the end of FILE's [Service] section, where
+# systemd reads it (appended to the file it would land under [Install]).
+addenv() {
+    local f="${2:-$UNIT}"
+    awk -v l="$1" '/^\[/ { if (s) { print l; s = 0; d = 1 } s = ($0 == "[Service]") }
+        { print } END { if (s && !d) print l }' "$f" > "$f.new" && mv "$f.new" "$f"
+}
 
 echo "## 1. a dry run writes nothing"
 
@@ -115,7 +122,18 @@ check "the curve landed in the unit"       inunit 'Environment="TEP_CURVE=70:40 
 check "hyst landed in the unit"            inunit 'Environment=TEP_HYST=5'
 # A value containing a space must be quoted or systemd reads only the first word.
 check "a space-bearing value is quoted"    inunit 'Environment="TEP_SENSORS=k10temp"'
-check "ExecStopPost hands the fans back"   inunit 'ExecStopPost'
+check "ExecStopPost hands the fans back"   inunit "ExecStopPost=$T/stub/ectool autofanctrl"
+# The daemon reads these from its environment; without them the service looked
+# for /usr/bin/ectool whatever install was told (Kamino item 184).
+check "the --ectool path is in the unit"   inunit "Environment=\"TEP_ECTOOL=$T/stub/ectool\""
+check "the --hwmon root is in the unit"    inunit "Environment=\"TEP_HWMON=$H\""
+check "config reads them back from the unit" bash -c '
+    out="$(TEP_SUDO="" TEP_SYSTEMCTL="$2/stub/systemctl" bash "$1" config --unit "$3" --unit-dirs "$2/units" 2>/dev/null)"
+    grep -qxF "ectool=$2/stub/ectool" <<<"$out" && grep -qxF "hwmon=$4" <<<"$out"' _ "$E" "$T" "$UNIT" "$H"
+check "a relative --ectool is refused by install" nq install --force --ectool stub/ectool
+check "a --ectool with a space is refused"        nq install --force --ectool "/opt/fw tools/ectool"
+check "a --hwmon with a % is refused"             nq install --force --hwmon "/sys/%n"
+check "  and the unit is untouched"               inunit "Environment=\"TEP_ECTOOL=$T/stub/ectool\""
 # --unit sets the file path; the unit NAME systemctl is told to enable and
 # restart has to be that same file, not one derived from the script's name.
 check "systemctl is told the unit file's own name" called "systemctl enable tep.service"
@@ -133,6 +151,16 @@ check "an explicit --curve overrides the unit" \
 check "and config_source admits the override" \
     grep -q 'overrides' <<< "$(Q config --curve "60:20" 2>/dev/null)"
 
+# A unit's values never went through flag parsing, so they are validated and
+# read as decimal too: a hand-edited TEP_HYST=08 would otherwise break every
+# step-down comparison the daemon makes.
+cp "$UNIT" "$T/unit.bak"
+addenv 'Environment=TEP_HYST=08'
+check "a unit's zero-padded hyst is read as decimal" [ "$(cfg hyst)" = "8" ]
+addenv 'Environment=TEP_INTERVAL=600'
+check "a unit's out-of-range interval is refused"   nq config
+cp "$T/unit.bak" "$UNIT"
+
 echo "## 4. an existing unit is somebody's tuning"
 
 # A line nothing in render_unit produces: if it survives, the file was edited
@@ -145,6 +173,14 @@ check "but the engine copy is refreshed"   cmp -s "$E" "$BIN"
 run install --force --curve "99:10"
 check "--force rewrites the curve"         inunit 'Environment="TEP_CURVE=99:10"'
 check "--force drops hand-added lines"     notunit 'MARKER=keepme'
+before="$(cat "$UNIT")"
+check "install refuses a falling-duty curve" nq install --force --curve "72:60 80:20"
+check "install refuses a leading-0% curve"   nq install --force --curve "60:0 90:100"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+run install --force --curve "60:0 90:100" --allow-stop
+check "install --allow-stop writes the permission" inunit 'Environment=TEP_ALLOW_STOP=1'
+run install --force --curve "99:10"
+check "a plain install writes TEP_ALLOW_STOP=0"    inunit 'Environment=TEP_ALLOW_STOP=0'
 
 echo "## 5. set-curve edits in place"
 
@@ -168,6 +204,89 @@ before="$(cat "$UNIT")"
 check "a bad curve is refused"             nq set-curve "80:50 70:40"
 check "and the unit is untouched"          [ "$(cat "$UNIT")" = "$before" ]
 check "set-curve with no points is refused" nq set-curve
+
+# A fan must never cool less as it gets hotter (Kamino item 183).
+check "a falling-duty curve is refused"    nq set-curve "72:60 80:20"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+check "a leading-0% curve is refused"      nq set-curve "60:0 90:100"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+run set-curve "60:0 90:100" --allow-stop
+check "--allow-stop lets it through"       inunit 'Environment="TEP_CURVE=60:0 90:100"'
+check "  and records the permission in the unit" inunit 'Environment=TEP_ALLOW_STOP=1'
+check "  config reports it"                [ "$(cfg allow_stop)" = "1" ]
+run set-curve "60:30 90:100"
+check "the next curve does not inherit it" inunit 'Environment=TEP_ALLOW_STOP=0'
+check "  exactly one ALLOW_STOP line"      [ "$(grep -cF 'TEP_ALLOW_STOP=' "$UNIT")" = "1" ]
+
+# A unit without the key (hand-written, or from before it existed): the line
+# belongs in [Service]. Appended at the end of the file it lands under
+# [Install], where systemd ignores it.
+printf '[Unit]\nDescription=x\n\n[Service]\nExecStart=/bin/true\n\n[Install]\nWantedBy=multi-user.target\n' > "$UNIT"
+run set-curve "60:0 90:100" --allow-stop
+svc_end="$(grep -n '^\[Install\]' "$UNIT" | cut -d: -f1)"
+check "missing keys are added under [Service], not [Install]" bash -c '
+    for k in TEP_CURVE TEP_ALLOW_STOP; do
+        n="$(grep -n "$k=" "$1" | cut -d: -f1)"; [[ -n "$n" ]] && (( n < $2 )) || exit 1
+    done' _ "$UNIT" "$svc_end"
+# A unit whose curve stops the fans without the permission (a hand edit): the
+# reports say the service will refuse it.
+printf '[Service]\nEnvironment="TEP_CURVE=60:0 90:100"\n' > "$UNIT"
+check "config warns about a unit's 0% curve" grep -q 'refuse it without --allow-stop' <<< "$(Q config 2>&1 >/dev/null)"
+printf '%s\n' "$before" > "$UNIT"
+
+echo "## 5b. the service's environment: last assignment wins, drop-ins count"
+
+# Every report has to answer with what systemd will hand the daemon, and set-
+# curve must not "succeed" at a line that no longer counts.
+cp "$UNIT" "$T/unit.bak"
+run install --force --curve "70:40 80:100"
+addenv 'Environment="TEP_CURVE=66:44"'
+check "the last assignment in the unit wins" [ "$(cfg curve)" = "66:44" ]
+addenv 'Environment="TEP_HYST=6" "TEP_INTERVAL=2"'
+check "several assignments on one line are read" bash -c '[ "$(sed -n "s/^hyst=//p" <<<"$1")" = 6 ] && [ "$(sed -n "s/^interval=//p" <<<"$1")" = 2 ]' _ "$(Q config 2>/dev/null)"
+run install --force --curve "70:40 80:100"
+
+# `systemctl edit` writes <unit>.d/override.conf; a package ships one under
+# /usr/lib/systemd/system/<unit>.d/. Both apply after the unit.
+mkdir -p "$UNIT.d"
+printf '[Service]\nEnvironment="TEP_CURVE=50:50 90:100"\n' > "$UNIT.d/override.conf"
+check "config reports a drop-in's curve"   [ "$(cfg curve)" = "50:50 90:100" ]
+check "  and config_source names the drop-in" grep -qF "$UNIT.d/override.conf" <<< "$(cfg config_source)"
+check "status reports it too"              grep -qF '50:50 90:100' <<< "$(Q status 2>/dev/null)"
+before="$(cat "$UNIT")"; : > "$CALLS"
+out="$(Q set-curve "60:30 90:100" 2>&1)" && rc=0 || rc=$?
+check "set-curve refuses when a drop-in sets TEP_CURVE" [ "$rc" != 0 ]
+check "  naming the drop-in"               grep -qF "$UNIT.d/override.conf" <<< "$out"
+check "  and leaves the unit untouched"    [ "$(cat "$UNIT")" = "$before" ]
+check "  and restarts nothing"             missing "systemctl daemon-reload"
+
+# A drop-in in a unit directory, and file-name order across directories.
+rm -rf "$UNIT.d"; mkdir -p "$UDIRS/tep.service.d"
+printf '[Service]\nEnvironment="TEP_CURVE=55:55 90:100"\n' > "$UDIRS/tep.service.d/10-a.conf"
+printf '[Service]\nEnvironment="TEP_CURVE=57:57 90:100"\n' > "$UDIRS/tep.service.d/20-b.conf"
+check "drop-ins in a unit directory count, applied in name order" [ "$(cfg curve)" = "57:57 90:100" ]
+mkdir -p "$UNIT.d"; printf '[Service]\nEnvironment="TEP_HYST=9"\n' > "$UNIT.d/20-b.conf"
+check "  and a same-named drop-in earlier in the path masks it" [ "$(cfg curve)" = "55:55 90:100" ]
+check "  while its own keys apply"         [ "$(cfg hyst)" = "9" ]
+rm -rf "$UNIT.d" "$UDIRS/tep.service.d"
+
+# An empty Environment= clears everything set before it, unit included.
+mkdir -p "$UNIT.d"; printf '[Service]\nEnvironment=\n' > "$UNIT.d/reset.conf"
+check "an empty Environment= in a drop-in clears the unit's curve" [ "$(cfg curve)" = "72:35 78:60 84:85 88:100" ]
+check "  and set-curve refuses, naming it" grep -qF 'reset.conf' <<< "$(Q set-curve "60:30 90:100" 2>&1)"
+rm -rf "$UNIT.d"
+
+# Only [Service] counts: systemd ignores Environment= anywhere else.
+printf '\n[Install]\nEnvironment="TEP_CURVE=11:11"\n' >> "$UNIT"
+check "Environment= outside [Service] is ignored" [ "$(cfg curve)" = "70:40 80:100" ]
+# A line set-curve cannot rewrite (a second assignment on another key's line)
+# would keep winning: refused rather than reported as done.
+run install --force --curve "70:40 80:100"
+addenv 'Environment="TEP_HYST=4" "TEP_CURVE=61:61"'
+before="$(cat "$UNIT")"
+check "set-curve refuses a curve line it cannot rewrite" nq set-curve "60:30 90:100"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+cp "$T/unit.bak" "$UNIT"
 
 echo "## 6. uninstall"
 

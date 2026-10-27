@@ -50,8 +50,6 @@ check "below the first point the EC gets control back" \
     [ "$(Q simulate --curve "70:40" 60 2>/dev/null)" = "$(printf '60\tauto (EC)')" ]
 check "a single-point curve is a valid curve" \
     [ "$(Q simulate --curve "70:40" 75 2>/dev/null)" = "$(printf '75\t40%%')" ]
-check "0% is a usable duty (fans off, still under our control)" \
-    [ "$(Q simulate --curve "70:0" 75 2>/dev/null)" = "$(printf '75\t0%%')" ]
 
 # Sub-zero readings are not hypothetical: a sensor that has not initialised can
 # report a negative value, and it must not be treated as a parse error.
@@ -92,6 +90,55 @@ check "simulate ignores the installed unit" \
     [ "$(bash "$E" simulate --unit "$T/u.service" --curve "70:40" 75 2>/dev/null)" = "$(printf '75\t40%%')" ]
 check "curve reads the installed unit" \
     [ "$(bash "$E" curve --unit "$T/u.service" 2>/dev/null)" = "$(printf '10\t99')" ]
+
+echo "## 4. a fan never cools less as it gets hotter"
+
+# Before: "72:60 80:20" was accepted and gave 20% at 85C, and a curve starting
+# at 0% passed without a word. Same rules as carbonite (its Kamino item 112).
+check "a falling duty is refused"               fails simulate --curve "72:60 80:20" 85
+err="$(Q simulate --curve "72:60 80:20" 85 2>&1 >/dev/null)"
+check "  naming the point and the rule"         grep -q "'80:20' is 20% after 60%" <<< "$err"
+check "a falling duty anywhere is refused"      fails simulate --curve "60:30 70:50 80:45 90:100" 85
+check "a hot 0% step is refused"                fails simulate --curve "60:40 90:0" 95
+check "a flat duty is fine"                     silent simulate --curve "60:50 70:50" 75
+
+# 0% can then only be the coolest steps. It still stops fans that the EC's own
+# control keeps turning below the first point, so simulate says so.
+out="$(Q simulate --curve "60:0 90:100" 70 95 2>"$T/err")"
+check "a leading 0% step is simulated"          [ "$out" = "$(printf '70\t0%%\n95\t100%%')" ]
+check "  with a warning naming where it stops"  grep -q '0% from 60C until 90C' "$T/err"
+check "  and that it is refused without --allow-stop" grep -q 'allow-stop' "$T/err"
+Q simulate --curve "70:0" 75 >/dev/null 2>"$T/err"
+check "an all-0% curve warns 'from 70C up'"     grep -q '0% from 70C up' "$T/err"
+Q simulate --curve "60:0 90:100" --allow-stop 70 >/dev/null 2>"$T/err"
+check "--allow-stop silences the warning"       [ ! -s "$T/err" ]
+Q simulate --curve "72:35 78:60 84:85 88:100" 70 >/dev/null 2>"$T/err"
+check "a curve with no 0% warns nothing"        [ ! -s "$T/err" ]
+
+echo "## 5. numbers are decimal, whatever their leading zeros"
+
+# Bash arithmetic reads a leading zero as octal. Before: 072 was a step at 58C,
+# 090 was refused with a misleading "must ascend", and --hyst 08 passed the
+# check and then broke every step-down comparison — the fan never came down.
+check "072:35 is a step at 72C, not 58C" \
+    [ "$(Q simulate --curve "072:35" 60 72 2>/dev/null)" = "$(printf '60\tauto (EC)\n72\t35%%')" ]
+check "08 and 090 are valid temperatures" \
+    [ "$(Q simulate --curve "08:10 090:100" 9 90 2>/dev/null)" = "$(printf '9\t10%%\n90\t100%%')" ]
+check "a zero-padded duty is decimal" \
+    [ "$(Q simulate --curve "70:080" 75 2>/dev/null)" = "$(printf '75\t80%%')" ]
+check "--hyst 08 steps down 8 below the step" \
+    [ "$(Q simulate --curve "70:40 80:100" --hyst 08 85 72 71 2>/dev/null)" = "$(printf '85\t100%%\n72\t100%%\n71\t40%%')" ]
+check "a zero-padded simulate temperature is decimal" \
+    [ "$(Q simulate --curve "70:40" 071 2>/dev/null)" = "$(printf '71\t40%%')" ]
+check "--interval 09 is accepted"      silent simulate --curve "70:40" --interval 09 75
+
+echo "## 6. --interval has a ceiling"
+
+check "--interval 60 is accepted"      silent simulate --curve "70:40" --interval 60 75
+check "--interval 61 is refused"       fails simulate --curve "70:40" --interval 61 75
+err="$(Q simulate --curve "70:40" --interval 600 75 2>&1 >/dev/null)"
+check "  and the refusal states the ceiling" grep -q 'at most 60 seconds' <<< "$err"
+check "a 20-digit number is refused, not overflowed" fails simulate --curve "70:40" --hyst 99999999999999999999 75
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

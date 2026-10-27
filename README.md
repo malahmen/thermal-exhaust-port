@@ -94,15 +94,25 @@ $ ./thermal-exhaust-port.sh simulate --curve "72:35 78:60 84:85 88:100" 71 72 79
 
 `simulate` touches no hardware, so try a curve before installing it.
 
+**A fan never cools less as it gets hotter.** Duties may not fall from one step
+to the next — `72:60 80:20` (20% at 85 °C) is refused, naming the point. That
+leaves 0% (fans stopped) possible only on the coolest steps, and even there it
+stops fans that the EC's own control, below the first point, keeps turning:
+`60:0 90:100` stops them from 60 °C until 90 °C. `run`, `install` and
+`set-curve` refuse such a curve unless `--allow-stop` says the fans may stop
+(the unit records it as `TEP_ALLOW_STOP=1`, and `set-curve` without the flag
+resets it); `simulate` warns. The same rules as carbonite.
+
 ## Tuning
 
 | Flag | `TEP_*` | Default | Meaning |
 | --- | --- | --- | --- |
 | `--curve` | `TEP_CURVE` | `72:35 78:60 84:85 88:100` | `degC:duty%` points, ascending |
 | `--hyst` | `TEP_HYST` | `4` | degC to fall below a step before dropping to it |
-| `--interval` | `TEP_INTERVAL` | `3` | seconds between checks |
+| `--interval` | `TEP_INTERVAL` | `3` | seconds between checks, 1-60: a loaded SoC climbs tens of degrees in a few seconds |
 | `--reassert` | `TEP_REASSERT` | `60` | seconds; re-send the current state |
 | `--sensors` | `TEP_SENSORS` | `k10temp amdgpu` | hwmon names to watch, hottest wins |
+| `--allow-stop` | `TEP_ALLOW_STOP=1` | off | let a curve start with 0% steps (fans stopped) |
 | `--ectool` | `TEP_ECTOOL` | `/usr/bin/ectool` | the EC tool |
 | `--hwmon` | `TEP_HWMON` | `/sys/class/hwmon` | sysfs hwmon root |
 | `--unit-dirs` | `TEP_UNIT_DIRS` | the four systemd dirs | where `conflicts` looks for unit files |
@@ -116,8 +126,9 @@ Change the curve of a running service without editing the unit by hand:
 ```
 
 It validates the new curve **before** touching the file, rewrites only the
-`CURVE=` line — so an interval or a dependency you added by hand survives — and
-restarts the service only if it was already running.
+`TEP_CURVE=` and `TEP_ALLOW_STOP=` lines — so an interval or a dependency you
+added by hand survives; a missing line goes under `[Service]` — and restarts
+the service only if it was already running.
 
 ## Where the configuration lives
 
@@ -128,16 +139,32 @@ the CLI and ignored by the service: two sources of truth that disagree exactly
 when it matters.
 
 The unit sets the **`TEP_`-prefixed** names — `TEP_CURVE`, `TEP_HYST`,
-`TEP_INTERVAL`, `TEP_REASSERT`, `TEP_SENSORS` — because those are the ones the
+`TEP_INTERVAL`, `TEP_REASSERT`, `TEP_SENSORS`, `TEP_ALLOW_STOP`, `TEP_ECTOOL`,
+`TEP_HWMON` — because those are the ones the
 daemon reads from its environment. These must stay in step: a unit that sets a
 name the daemon ignores makes the service run its defaults while `status`
 reports the unit's curve, which is the worst of both. `tests/test-run.sh`
 exports the generated unit's `Environment` lines, starts the daemon with no
 flags, and asserts it announces the unit's values — and audits that every key
-written is one the engine reads. A unit from before the prefix is detected and
+written is one the engine reads, and that every one of them is written:
+`install --ectool /opt/fw/ectool` once left the service looking for
+`/usr/bin/ectool` and restarting every 5 s. `install` refuses a relative
+`--ectool`, `--hwmon` or `--bin`, or one with a space, quote, backslash, `%`
+or `$`, which systemd would reinterpret in the unit. A unit from before the prefix is detected and
 called out rather than silently misreported. `status`, `once`, `curve` and `config` read the unit back;
 `set-curve` rewrites it. An explicit flag or `TEP_*` variable overrides it, and
 `config` says so in its `config_source` line.
+
+**Drop-ins count.** `systemctl edit` writes `<unit>.d/override.conf`, and
+systemd applies it after the unit; the reports read the unit and its drop-ins
+(`<unit>.d/` beside it and `<dir>/<unit>.d/` in each `--unit-dirs` directory)
+as systemd does — sorted by file name, last assignment wins, an empty
+`Environment=` clears what came before, only `[Service]` counts — and
+`config_source` names any drop-in that supplied a value. `set-curve` refuses
+when a drop-in sets `TEP_CURVE` or `TEP_ALLOW_STOP`, naming it: rewriting the
+unit under it would change nothing the service runs. It also reads its result
+back before writing it, and refuses rather than leave a line it cannot rewrite
+winning. `EnvironmentFile=` is not read.
 
 `simulate` is the deliberate exception — it ignores the unit, because it is the
 "what if" command.
@@ -191,17 +218,27 @@ journal lines for the real answer.
   read. A hardcoded `hwmon6` silently starts reading the wrong chip.
 - **An unreadable sensor is not a cold machine.** A failed read holds the
   current duty and says so once, rather than handing a hot machine back to the
-  EC on the strength of it.
+  EC on the strength of a driver rebinding. But not indefinitely: after 3
+  failed reads in a row the fans go back to the EC — whose own control reads
+  its own sensors — with an `[error]` line, and the curve resumes when a
+  watched sensor answers again. A blind loop would otherwise hold a possibly
+  low duty on a machine that is heating up.
+- **A watched chip that disappears is logged** (`watched sensor 'amdgpu' is
+  gone`), as is one that is missing at start and one that comes back: the
+  curve then follows the others, which may be the cooler ones.
 - **The fans always go back to the EC.** An `EXIT` trap, separate signal traps
   that actually exit, and `ExecStopPost` in the unit. A `TERM` handler that only
   cleans up does *not* end the process — bash resumes the loop — so `systemctl
   stop` would otherwise hand the fans back and then wait for SIGKILL.
 - **The EC forgets a forced duty across suspend/resume**, so the current state
   is re-sent every `--reassert` seconds even when nothing changed.
+- **Numbers are decimal.** Curve points, `--hyst`, `--interval`, `--reassert`
+  and the unit's values are read with `10#`, so `072:35` is a step at 72 °C
+  and `--hyst 08` is 8 — bash arithmetic would otherwise take them as octal.
 - **`set -e` is deliberately absent.** `(( s-- ))` evaluating to 0 returns
   non-zero, and errexit would kill the daemon loop mid-step.
-- **The unit is parsed in pure bash**, not by `eval`-ing `systemctl show -p
-  Environment`. That output is shell-quoted, and eval on a root-owned file
+- **The unit and its drop-ins are parsed in pure bash**, not by `eval`-ing
+  `systemctl show -p Environment`. That output is shell-quoted, and eval on a root-owned file
   people hand-edit is a code-injection path for no benefit.
 - **`install` keeps an existing unit** unless `--force`, so re-running it after
   pulling a new version does not reset a curve somebody chose on purpose.
@@ -221,7 +258,11 @@ tests/run-all.sh
 No network, no hardware, no privilege — a fake sysfs tree, recording `ectool`
 and `systemctl` stubs, and `TEP_SUDO=""`. `tests/test-run.sh` drives the real
 daemon loop, changes the temperature under it, and asserts on the `ectool` calls
-it makes.
+it makes: the re-assert on a steady temperature, a refused `ectool` call retried
+on the next tick, a lost sensor, and the daemon actually exiting on `TERM`
+(bounded, so a regression fails rather than hangs). `run-all.sh` also bounds
+each file (`TEP_TEST_TIMEOUT`, default 300 s), and `tests/test-run-all.sh`
+checks that it does.
 
 ## License
 
