@@ -93,6 +93,13 @@ called() { grep -qF "$1" "$CALLS"; }
 missing(){ ! grep -qF "$1" "$CALLS"; }
 inunit() { grep -qF "$1" "$UNIT"; }
 notunit(){ ! grep -qF "$1" "$UNIT"; }
+# addenv LINE [FILE] — add LINE at the end of FILE's [Service] section, where
+# systemd reads it (appended to the file it would land under [Install]).
+addenv() {
+    local f="${2:-$UNIT}"
+    awk -v l="$1" '/^\[/ { if (s) { print l; s = 0; d = 1 } s = ($0 == "[Service]") }
+        { print } END { if (s && !d) print l }' "$f" > "$f.new" && mv "$f.new" "$f"
+}
 
 echo "## 1. a dry run writes nothing"
 
@@ -148,9 +155,9 @@ check "and config_source admits the override" \
 # read as decimal too: a hand-edited TEP_HYST=08 would otherwise break every
 # step-down comparison the daemon makes.
 cp "$UNIT" "$T/unit.bak"
-printf 'Environment=TEP_HYST=08\n' >> "$UNIT"
+addenv 'Environment=TEP_HYST=08'
 check "a unit's zero-padded hyst is read as decimal" [ "$(cfg hyst)" = "8" ]
-printf 'Environment=TEP_INTERVAL=600\n' >> "$UNIT"
+addenv 'Environment=TEP_INTERVAL=600'
 check "a unit's out-of-range interval is refused"   nq config
 cp "$T/unit.bak" "$UNIT"
 
@@ -226,6 +233,60 @@ check "missing keys are added under [Service], not [Install]" bash -c '
 printf '[Service]\nEnvironment="TEP_CURVE=60:0 90:100"\n' > "$UNIT"
 check "config warns about a unit's 0% curve" grep -q 'refuse it without --allow-stop' <<< "$(Q config 2>&1 >/dev/null)"
 printf '%s\n' "$before" > "$UNIT"
+
+echo "## 5b. the service's environment: last assignment wins, drop-ins count"
+
+# Every report has to answer with what systemd will hand the daemon, and set-
+# curve must not "succeed" at a line that no longer counts.
+cp "$UNIT" "$T/unit.bak"
+run install --force --curve "70:40 80:100"
+addenv 'Environment="TEP_CURVE=66:44"'
+check "the last assignment in the unit wins" [ "$(cfg curve)" = "66:44" ]
+addenv 'Environment="TEP_HYST=6" "TEP_INTERVAL=2"'
+check "several assignments on one line are read" bash -c '[ "$(sed -n "s/^hyst=//p" <<<"$1")" = 6 ] && [ "$(sed -n "s/^interval=//p" <<<"$1")" = 2 ]' _ "$(Q config 2>/dev/null)"
+run install --force --curve "70:40 80:100"
+
+# `systemctl edit` writes <unit>.d/override.conf; a package ships one under
+# /usr/lib/systemd/system/<unit>.d/. Both apply after the unit.
+mkdir -p "$UNIT.d"
+printf '[Service]\nEnvironment="TEP_CURVE=50:50 90:100"\n' > "$UNIT.d/override.conf"
+check "config reports a drop-in's curve"   [ "$(cfg curve)" = "50:50 90:100" ]
+check "  and config_source names the drop-in" grep -qF "$UNIT.d/override.conf" <<< "$(cfg config_source)"
+check "status reports it too"              grep -qF '50:50 90:100' <<< "$(Q status 2>/dev/null)"
+before="$(cat "$UNIT")"; : > "$CALLS"
+out="$(Q set-curve "60:30 90:100" 2>&1)" && rc=0 || rc=$?
+check "set-curve refuses when a drop-in sets TEP_CURVE" [ "$rc" != 0 ]
+check "  naming the drop-in"               grep -qF "$UNIT.d/override.conf" <<< "$out"
+check "  and leaves the unit untouched"    [ "$(cat "$UNIT")" = "$before" ]
+check "  and restarts nothing"             missing "systemctl daemon-reload"
+
+# A drop-in in a unit directory, and file-name order across directories.
+rm -rf "$UNIT.d"; mkdir -p "$UDIRS/tep.service.d"
+printf '[Service]\nEnvironment="TEP_CURVE=55:55 90:100"\n' > "$UDIRS/tep.service.d/10-a.conf"
+printf '[Service]\nEnvironment="TEP_CURVE=57:57 90:100"\n' > "$UDIRS/tep.service.d/20-b.conf"
+check "drop-ins in a unit directory count, applied in name order" [ "$(cfg curve)" = "57:57 90:100" ]
+mkdir -p "$UNIT.d"; printf '[Service]\nEnvironment="TEP_HYST=9"\n' > "$UNIT.d/20-b.conf"
+check "  and a same-named drop-in earlier in the path masks it" [ "$(cfg curve)" = "55:55 90:100" ]
+check "  while its own keys apply"         [ "$(cfg hyst)" = "9" ]
+rm -rf "$UNIT.d" "$UDIRS/tep.service.d"
+
+# An empty Environment= clears everything set before it, unit included.
+mkdir -p "$UNIT.d"; printf '[Service]\nEnvironment=\n' > "$UNIT.d/reset.conf"
+check "an empty Environment= in a drop-in clears the unit's curve" [ "$(cfg curve)" = "72:35 78:60 84:85 88:100" ]
+check "  and set-curve refuses, naming it" grep -qF 'reset.conf' <<< "$(Q set-curve "60:30 90:100" 2>&1)"
+rm -rf "$UNIT.d"
+
+# Only [Service] counts: systemd ignores Environment= anywhere else.
+printf '\n[Install]\nEnvironment="TEP_CURVE=11:11"\n' >> "$UNIT"
+check "Environment= outside [Service] is ignored" [ "$(cfg curve)" = "70:40 80:100" ]
+# A line set-curve cannot rewrite (a second assignment on another key's line)
+# would keep winning: refused rather than reported as done.
+run install --force --curve "70:40 80:100"
+addenv 'Environment="TEP_HYST=4" "TEP_CURVE=61:61"'
+before="$(cat "$UNIT")"
+check "set-curve refuses a curve line it cannot rewrite" nq set-curve "60:30 90:100"
+check "  and the unit is untouched"        [ "$(cat "$UNIT")" = "$before" ]
+cp "$T/unit.bak" "$UNIT"
 
 echo "## 6. uninstall"
 

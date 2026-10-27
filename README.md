@@ -155,6 +155,17 @@ called out rather than silently misreported. `status`, `once`, `curve` and `conf
 `set-curve` rewrites it. An explicit flag or `TEP_*` variable overrides it, and
 `config` says so in its `config_source` line.
 
+**Drop-ins count.** `systemctl edit` writes `<unit>.d/override.conf`, and
+systemd applies it after the unit; the reports read the unit and its drop-ins
+(`<unit>.d/` beside it and `<dir>/<unit>.d/` in each `--unit-dirs` directory)
+as systemd does — sorted by file name, last assignment wins, an empty
+`Environment=` clears what came before, only `[Service]` counts — and
+`config_source` names any drop-in that supplied a value. `set-curve` refuses
+when a drop-in sets `TEP_CURVE` or `TEP_ALLOW_STOP`, naming it: rewriting the
+unit under it would change nothing the service runs. It also reads its result
+back before writing it, and refuses rather than leave a line it cannot rewrite
+winning. `EnvironmentFile=` is not read.
+
 `simulate` is the deliberate exception — it ignores the unit, because it is the
 "what if" command.
 
@@ -226,8 +237,8 @@ journal lines for the real answer.
   and `--hyst 08` is 8 — bash arithmetic would otherwise take them as octal.
 - **`set -e` is deliberately absent.** `(( s-- ))` evaluating to 0 returns
   non-zero, and errexit would kill the daemon loop mid-step.
-- **The unit is parsed in pure bash**, not by `eval`-ing `systemctl show -p
-  Environment`. That output is shell-quoted, and eval on a root-owned file
+- **The unit and its drop-ins are parsed in pure bash**, not by `eval`-ing
+  `systemctl show -p Environment`. That output is shell-quoted, and eval on a root-owned file
   people hand-edit is a code-injection path for no benefit.
 - **`install` keeps an existing unit** unless `--force`, so re-running it after
   pulling a new version does not reset a curve somebody chose on purpose.

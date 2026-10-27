@@ -199,6 +199,11 @@ CONFIGURATION
   'set-curve' rewrites it. An explicit flag or TEP_* variable overrides it.
   'simulate' deliberately ignores the unit — it is the "what if" command.
 
+  Drop-ins count, as systemd applies them (<unit>.d/*.conf and <dir>/<unit>.d/
+  in each unit directory; last assignment wins). 'set-curve' refuses when a
+  drop-in sets TEP_CURVE or TEP_ALLOW_STOP, and names it: that is the file to
+  edit. EnvironmentFile= is not read.
+
   Nothing is installed for you: ectool comes from the host's firmware tooling
   (on Bazzite it is already there), and a missing one is reported.
 
@@ -359,23 +364,93 @@ apply() {
 # Unit as configuration
 # -----------------------------------------------------------------------------
 
-# Echoes the value of Environment=KEY= from the unit; the last one wins, as
-# systemd does. Parsed here rather than by eval-ing `systemctl show -p
-# Environment`, whose output is shell-quoted: eval on a root-owned file that
-# people hand-edit is a code-injection path for no benefit.
-unit_env() {
-    local key="$1" line val out=""
-    [[ -r "$UNIT" ]] || return 1
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" == Environment=* ]] || continue
-        val="${line#Environment=}"
-        val="${val%\"}"; val="${val#\"}"
-        [[ "$val" == "$key="* ]] || continue
-        out="${val#"$key="}"
-    done < "$UNIT"
-    [[ -n "$out" ]] || return 1
-    printf '%s\n' "$out"
+# The files systemd reads for this unit, in the order it applies them: the
+# unit itself, then its drop-ins — <unit>.d/ beside it, and <dir>/<name>.d/ in
+# each unit directory. A drop-in name in an earlier directory masks the same
+# name in a later one (/etc over /run over /usr/lib), and drop-ins apply sorted
+# by file name across all directories. `systemctl edit` writes one of these,
+# and before, status, config and set-curve never looked: they reported a curve
+# a drop-in had replaced, and set-curve rewrote a line that no longer counted.
+_unit_files() {
+    [[ -r "$UNIT" ]] || return 0
+    printf '%s\n' "$UNIT"
+    local d f b
+    local -a dirs=("${UNIT}.d")
+    local -A by_name=()
+    for d in $UNIT_DIRS; do dirs+=("${d}/${SERVICE}.d"); done
+    for d in "${dirs[@]}"; do
+        for f in "$d"/*.conf; do
+            [[ -r "$f" ]] || continue
+            b="${f##*/}"
+            [[ -n "${by_name[$b]+set}" ]] || by_name[$b]="$f"
+        done
+    done
+    (( ${#by_name[@]} )) || return 0
+    while IFS= read -r b; do
+        printf '%s\n' "${by_name[$b]}"
+    done < <(printf '%s\n' "${!by_name[@]}" | LC_ALL=C sort)
 }
+
+# _env_assignments VALUE — the assignments in one Environment= value, one per
+# line, split and unquoted as systemd does: words on whitespace, "..." and
+# '...' quote, a backslash takes the next character literally. One line can
+# carry several (Environment="A=1" "B=2").
+_env_assignments() {
+    local s="$1" w="" q="" c i have=0
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == '\' ]] && (( i + 1 < ${#s} )); then
+            i=$(( i + 1 )); w+="${s:i:1}"; have=1
+        elif [[ -n "$q" ]]; then
+            if [[ "$c" == "$q" ]]; then q=""; else w+="$c"; fi
+        elif [[ "$c" == '"' || "$c" == "'" ]]; then
+            q="$c"; have=1
+        elif [[ "$c" == [[:space:]] ]]; then
+            (( have )) && printf '%s\n' "$w"
+            w=""; have=0
+        else
+            w+="$c"; have=1
+        fi
+    done
+    (( have )) && printf '%s\n' "$w"
+    return 0
+}
+
+# _unit_env_scan KEY [FILE] — what the service's environment ends up with for
+# KEY, across the unit and its drop-ins (or FILE alone): the last assignment
+# wins and an empty "Environment=" clears everything before it, both as in
+# systemd; only [Service] counts. Sets UE_VAL, and UE_SRC to the file that
+# decided it ("" if nothing did). Returns 1 when KEY ends up unset or empty.
+#
+# Parsed here rather than by eval-ing `systemctl show -p Environment`, whose
+# output is shell-quoted: eval on a root-owned file that people hand-edit is a
+# code-injection path for no benefit. Not read: EnvironmentFile=.
+UE_VAL="" UE_SRC=""
+_unit_env_scan() {
+    local key="$1" f line sect val a
+    UE_VAL=""; UE_SRC=""
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        sect=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            if [[ "$line" == \[*\] ]]; then sect="$line"; continue; fi
+            [[ "$sect" == "[Service]" ]] || continue
+            [[ "$line" =~ ^Environment[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+            val="${BASH_REMATCH[1]}"
+            if [[ -z "$val" ]]; then UE_VAL=""; UE_SRC="$f"; continue; fi
+            while IFS= read -r a; do
+                [[ "$a" == "${key}="* ]] || continue
+                UE_VAL="${a#"${key}="}"; UE_SRC="$f"
+            done < <(_env_assignments "$val")
+        done < "$f"
+    done < <(if [[ -n "${2:-}" ]]; then printf '%s\n' "$2"; else _unit_files; fi)
+    [[ -n "$UE_VAL" ]]
+}
+
+# Echoes the value KEY ends up with (see _unit_env_scan).
+unit_env() { _unit_env_scan "$1" || return 1; printf '%s\n' "$UE_VAL"; }
 
 # Another process forcing a duty is invisible after the fact: the EC has one
 # duty register, no record of who wrote it, and this firmware answers
@@ -433,7 +508,8 @@ CONFIG_SRC="defaults"
 # "what is my machine doing" commands answer about the running service instead
 # of about this script's defaults.
 load_unit_config() {
-    local key var val seen=0 overridden=0
+    local key var val seen=0 overridden=0 src
+    local -a dropins=()
     if [[ -r "$UNIT" ]]; then
         # TEP_-prefixed, matching what the daemon reads from its environment.
         # These MUST be the same names render_unit writes: a unit setting a key
@@ -441,7 +517,8 @@ load_unit_config() {
         # KEY:VARIABLE, since TEP_HWMON lands in HWMON_ROOT.
         for key in CURVE HYST INTERVAL REASSERT SENSORS ALLOW_STOP ECTOOL HWMON:HWMON_ROOT; do
             var="${key#*:}"; key="${key%%:*}"
-            val="$(unit_env "TEP_${key}")" || val=""
+            _unit_env_scan "TEP_${key}" || true
+            val="$UE_VAL"
             # An explicit value wins; it is an override only where it differs
             # from what the unit says.
             if [[ -n "${FROM_ENV[$key]:-}" ]]; then
@@ -451,6 +528,10 @@ load_unit_config() {
             [[ -n "$val" ]] || continue
             printf -v "$var" '%s' "$val"
             seen=1
+            if [[ "$UE_SRC" != "$UNIT" ]]; then
+                for src in ${dropins[@]+"${dropins[@]}"}; do [[ "$src" == "$UE_SRC" ]] && continue 2; done
+                dropins+=("$UE_SRC")
+            fi
         done
         # A unit from before the prefix sets CURVE=, which the daemon does not
         # read: it would run defaults while this reported the unit's curve.
@@ -458,6 +539,7 @@ load_unit_config() {
             warn "${UNIT} sets CURVE= but the service reads TEP_CURVE= — it is running defaults. Re-run: install --force"
         fi
         (( seen )) && CONFIG_SRC="$UNIT"
+        for src in ${dropins[@]+"${dropins[@]}"}; do CONFIG_SRC+=" + ${src}"; done
         (( overridden )) && CONFIG_SRC="${CONFIG_SRC} + overrides"
         validate_numbers
     fi
@@ -841,6 +923,16 @@ cmd_set_curve() {
     parse_curve
     _check_stop refuse
 
+    # A drop-in applies after the unit. Rewriting the unit's line under one
+    # that sets (or clears) the same key changes nothing the service runs while
+    # reporting success — so that is refused, naming the file to edit instead.
+    local k
+    for k in TEP_CURVE TEP_ALLOW_STOP; do
+        _unit_env_scan "$k" || true
+        [[ -z "$UE_SRC" || "$UE_SRC" == "$UNIT" ]] && continue
+        error_exit "${k} is decided by the drop-in ${UE_SRC}, which systemd applies after ${UNIT}: rewriting the unit would not change what the service runs. Change it in that drop-in (or remove it there, then re-run set-curve)."
+    done
+
     if (( DRY_RUN )); then
         info "would set CURVE=${CURVE} in ${UNIT} and restart ${SERVICE}"
         return 0
@@ -853,6 +945,20 @@ cmd_set_curve() {
     local out
     out="$(_set_env_line TEP_CURVE "Environment=\"TEP_CURVE=${CURVE}\"" < "$UNIT" \
         | _set_env_line TEP_ALLOW_STOP "Environment=TEP_ALLOW_STOP=${ALLOW_STOP}")"
+    # Read the result back before writing it: a line set-curve cannot rewrite
+    # (several assignments on one line, say) would otherwise keep winning.
+    local check var
+    check="$(mktemp)" || error_exit "mktemp failed"
+    printf '%s\n' "$out" > "$check"
+    for k in TEP_CURVE:CURVE TEP_ALLOW_STOP:ALLOW_STOP; do
+        var="${k#*:}"
+        _unit_env_scan "${k%%:*}" "$check" || true
+        [[ "$UE_VAL" == "${!var}" ]] && continue
+        rm -f "$check"
+        error_exit "${UNIT} would still set ${k%%:*}=${UE_VAL} on a line set-curve cannot rewrite — edit that line by hand."
+    done
+    rm -f "$check"
+
     printf '%s\n' "$out" | _install_as_root 644 "$UNIT" || error_exit "could not write ${UNIT}"
     success "curve set to ${CURVE}"
 
