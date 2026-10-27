@@ -139,13 +139,18 @@ the CLI and ignored by the service: two sources of truth that disagree exactly
 when it matters.
 
 The unit sets the **`TEP_`-prefixed** names — `TEP_CURVE`, `TEP_HYST`,
-`TEP_INTERVAL`, `TEP_REASSERT`, `TEP_SENSORS`, `TEP_ALLOW_STOP` — because those are the ones the
+`TEP_INTERVAL`, `TEP_REASSERT`, `TEP_SENSORS`, `TEP_ALLOW_STOP`, `TEP_ECTOOL`,
+`TEP_HWMON` — because those are the ones the
 daemon reads from its environment. These must stay in step: a unit that sets a
 name the daemon ignores makes the service run its defaults while `status`
 reports the unit's curve, which is the worst of both. `tests/test-run.sh`
 exports the generated unit's `Environment` lines, starts the daemon with no
 flags, and asserts it announces the unit's values — and audits that every key
-written is one the engine reads. A unit from before the prefix is detected and
+written is one the engine reads, and that every one of them is written:
+`install --ectool /opt/fw/ectool` once left the service looking for
+`/usr/bin/ectool` and restarting every 5 s. `install` refuses a relative
+`--ectool`, `--hwmon` or `--bin`, or one with a space, quote, backslash, `%`
+or `$`, which systemd would reinterpret in the unit. A unit from before the prefix is detected and
 called out rather than silently misreported. `status`, `once`, `curve` and `config` read the unit back;
 `set-curve` rewrites it. An explicit flag or `TEP_*` variable overrides it, and
 `config` says so in its `config_source` line.

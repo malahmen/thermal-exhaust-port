@@ -115,7 +115,7 @@ ASSUME_YES=0
 # Which knobs were given explicitly (flag or TEP_* variable)? An explicit value
 # always wins over what the installed unit says; see load_unit_config.
 declare -A FROM_ENV=()
-for _k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS TEP_ALLOW_STOP; do
+for _k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS TEP_ALLOW_STOP TEP_ECTOOL TEP_HWMON; do
     [[ -n "${!_k+set}" ]] && FROM_ENV["${_k#TEP_}"]=1
 done
 unset _k
@@ -425,15 +425,23 @@ CONFIG_SRC="defaults"
 # "what is my machine doing" commands answer about the running service instead
 # of about this script's defaults.
 load_unit_config() {
-    local key val seen=0 overridden=0
+    local key var val seen=0 overridden=0
     if [[ -r "$UNIT" ]]; then
         # TEP_-prefixed, matching what the daemon reads from its environment.
         # These MUST be the same names render_unit writes: a unit setting a key
         # the daemon ignores makes `status` report a curve that is not running.
-        for key in CURVE HYST INTERVAL REASSERT SENSORS ALLOW_STOP; do
-            if [[ -n "${FROM_ENV[$key]:-}" ]]; then overridden=1; continue; fi
-            val="$(unit_env "TEP_${key}")" || continue
-            printf -v "$key" '%s' "$val"
+        # KEY:VARIABLE, since TEP_HWMON lands in HWMON_ROOT.
+        for key in CURVE HYST INTERVAL REASSERT SENSORS ALLOW_STOP ECTOOL HWMON:HWMON_ROOT; do
+            var="${key#*:}"; key="${key%%:*}"
+            val="$(unit_env "TEP_${key}")" || val=""
+            # An explicit value wins; it is an override only where it differs
+            # from what the unit says.
+            if [[ -n "${FROM_ENV[$key]:-}" ]]; then
+                [[ -n "$val" && "$val" != "${!var}" ]] && overridden=1
+                continue
+            fi
+            [[ -n "$val" ]] || continue
+            printf -v "$var" '%s' "$val"
             seen=1
         done
         # A unit from before the prefix sets CURVE=, which the daemon does not
@@ -453,6 +461,22 @@ load_unit_config() {
     return 0
 }
 
+# The paths go into Environment= and ExecStopPost= verbatim. systemd expands
+# '%' specifiers and '$' variables there and splits ExecStopPost on whitespace,
+# and the service's working directory is /, so a relative path would point
+# somewhere else: such a path is refused rather than written into a unit that
+# runs something other than what was asked.
+_check_unit_paths() {
+    local n v
+    for n in ECTOOL HWMON_ROOT BIN; do
+        v="${!n}"
+        [[ "$v" == /* ]] || error_exit "${n,,} must be an absolute path for the unit (got '${v}')"
+        [[ "$v" =~ [[:space:]\"\'\\%\$] ]] \
+            && error_exit "${n,,} '${v}' has a character systemd would reinterpret in a unit (space, quote, backslash, % or \$)"
+    done
+    return 0
+}
+
 render_unit() {
     cat <<EOF
 [Unit]
@@ -468,6 +492,8 @@ Environment=TEP_INTERVAL=${INTERVAL}
 Environment=TEP_REASSERT=${REASSERT}
 Environment="TEP_SENSORS=${SENSORS}"
 Environment=TEP_ALLOW_STOP=${ALLOW_STOP}
+Environment="TEP_ECTOOL=${ECTOOL}"
+Environment="TEP_HWMON=${HWMON_ROOT}"
 ExecStart=${BIN} run
 # Belt and braces with the daemon's own trap: stopping the service must never
 # leave the fans pinned at whatever duty was last set.
@@ -673,6 +699,7 @@ cmd_status() {
 cmd_install() {
     parse_curve
     _check_stop refuse
+    _check_unit_paths
     [[ -x "$ECTOOL" ]] || warn "${ECTOOL} not found — install the host's EC tooling before starting the service."
 
     # Two fan daemons both writing the EC's single duty register fight, and the
@@ -835,10 +862,10 @@ main() {
             --reassert=*) REASSERT="${1#*=}";    FROM_ENV[REASSERT]=1; shift ;;
             --sensors)    [[ $# -ge 2 ]] || error_exit "--sensors needs NAMES"; SENSORS="$2";    FROM_ENV[SENSORS]=1;  shift 2 ;;
             --sensors=*)  SENSORS="${1#*=}";     FROM_ENV[SENSORS]=1;  shift ;;
-            --ectool)     [[ $# -ge 2 ]] || error_exit "--ectool needs PATH";   ECTOOL="$2";     shift 2 ;;
-            --ectool=*)   ECTOOL="${1#*=}";      shift ;;
-            --hwmon)      [[ $# -ge 2 ]] || error_exit "--hwmon needs DIR";     HWMON_ROOT="$2"; shift 2 ;;
-            --hwmon=*)    HWMON_ROOT="${1#*=}";  shift ;;
+            --ectool)     [[ $# -ge 2 ]] || error_exit "--ectool needs PATH";   ECTOOL="$2";     FROM_ENV[ECTOOL]=1; shift 2 ;;
+            --ectool=*)   ECTOOL="${1#*=}";      FROM_ENV[ECTOOL]=1; shift ;;
+            --hwmon)      [[ $# -ge 2 ]] || error_exit "--hwmon needs DIR";     HWMON_ROOT="$2"; FROM_ENV[HWMON]=1;  shift 2 ;;
+            --hwmon=*)    HWMON_ROOT="${1#*=}";  FROM_ENV[HWMON]=1;  shift ;;
             --unit-dirs)  [[ $# -ge 2 ]] || error_exit "--unit-dirs needs DIRS";  UNIT_DIRS="$2";  shift 2 ;;
             --unit-dirs=*) UNIT_DIRS="${1#*=}";  shift ;;
             --bin)        [[ $# -ge 2 ]] || error_exit "--bin needs PATH";      BIN="$2";        shift 2 ;;

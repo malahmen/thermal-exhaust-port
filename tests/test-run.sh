@@ -161,8 +161,10 @@ settemp 70
         line="${line#Environment=}"; line="${line%\"}"; line="${line#\"}"
         export "${line?}"
     done < "$T/envlines"
-    exec env TEP_SUDO="" bash "$E" run --ectool "$T/stub/ectool" --hwmon "$T/hwmon" \
-        >"$T/unitrun.log" 2>&1
+    # No --ectool and no --hwmon either: before, the unit carried neither, so
+    # the service looked for /usr/bin/ectool, exited "not found" and restarted
+    # every 5 s, never running the curve (Kamino item 184).
+    exec env TEP_SUDO="" bash "$E" run >"$T/unitrun.log" 2>&1
 ) &
 PID=$!
 check "the daemon applies the unit's curve, not its defaults" wait_for "fanduty 55"
@@ -176,10 +178,18 @@ kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; PID=""
 check "every Environment key is a TEP_ one the engine reads" bash -c '
     while IFS= read -r l; do
         k="${l#Environment=}"; k="${k#\"}"; k="${k%%=*}"
-        case "$k" in TEP_CURVE|TEP_HYST|TEP_INTERVAL|TEP_REASSERT|TEP_SENSORS|TEP_ALLOW_STOP) ;;
+        case "$k" in TEP_CURVE|TEP_HYST|TEP_INTERVAL|TEP_REASSERT|TEP_SENSORS|TEP_ALLOW_STOP|TEP_ECTOOL|TEP_HWMON) ;;
             *) echo "unread key in unit: $k" >&2; exit 1 ;;
         esac
     done < "'"$T"'/envlines"'
+# And the other way round: every knob the daemon needs from install's flags is
+# in the unit. A path given to install that the service never sees is the
+# same silent split.
+for k in TEP_CURVE TEP_HYST TEP_INTERVAL TEP_REASSERT TEP_SENSORS TEP_ALLOW_STOP TEP_ECTOOL TEP_HWMON; do
+    check "the unit carries ${k}" grep -q "^Environment=\"\{0,1\}${k}=" "$T/envlines"
+done
+check "  TEP_ECTOOL is the path install was given" grep -qxF "Environment=\"TEP_ECTOOL=$T/stub/ectool\"" "$T/envlines"
+check "  TEP_HWMON is the root install was given"  grep -qxF "Environment=\"TEP_HWMON=$T/hwmon\"" "$T/envlines"
 
 echo "## 6. the loop refuses to start without ectool"
 

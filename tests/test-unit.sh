@@ -115,7 +115,18 @@ check "the curve landed in the unit"       inunit 'Environment="TEP_CURVE=70:40 
 check "hyst landed in the unit"            inunit 'Environment=TEP_HYST=5'
 # A value containing a space must be quoted or systemd reads only the first word.
 check "a space-bearing value is quoted"    inunit 'Environment="TEP_SENSORS=k10temp"'
-check "ExecStopPost hands the fans back"   inunit 'ExecStopPost'
+check "ExecStopPost hands the fans back"   inunit "ExecStopPost=$T/stub/ectool autofanctrl"
+# The daemon reads these from its environment; without them the service looked
+# for /usr/bin/ectool whatever install was told (Kamino item 184).
+check "the --ectool path is in the unit"   inunit "Environment=\"TEP_ECTOOL=$T/stub/ectool\""
+check "the --hwmon root is in the unit"    inunit "Environment=\"TEP_HWMON=$H\""
+check "config reads them back from the unit" bash -c '
+    out="$(TEP_SUDO="" TEP_SYSTEMCTL="$2/stub/systemctl" bash "$1" config --unit "$3" --unit-dirs "$2/units" 2>/dev/null)"
+    grep -qxF "ectool=$2/stub/ectool" <<<"$out" && grep -qxF "hwmon=$4" <<<"$out"' _ "$E" "$T" "$UNIT" "$H"
+check "a relative --ectool is refused by install" nq install --force --ectool stub/ectool
+check "a --ectool with a space is refused"        nq install --force --ectool "/opt/fw tools/ectool"
+check "a --hwmon with a % is refused"             nq install --force --hwmon "/sys/%n"
+check "  and the unit is untouched"               inunit "Environment=\"TEP_ECTOOL=$T/stub/ectool\""
 # --unit sets the file path; the unit NAME systemctl is told to enable and
 # restart has to be that same file, not one derived from the script's name.
 check "systemctl is told the unit file's own name" called "systemctl enable tep.service"
